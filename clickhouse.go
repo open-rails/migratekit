@@ -395,6 +395,14 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 		return nil // Nothing to do, no lock needed
 	}
 
+	// Ensure lock table exists before locking.
+	// It's possible for the migrations table to exist while the lock table is missing
+	// (e.g. partially-initialized databases or older migratekit versions).
+	// CREATE TABLE IF NOT EXISTS is safe for concurrent execution.
+	if err = c.Setup(ctx); err != nil {
+		return err
+	}
+
 	// Acquire lock only when we have work to do
 	if err = c.Lock(ctx); err != nil {
 		return err
