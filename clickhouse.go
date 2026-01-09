@@ -63,13 +63,6 @@ func NewClickHouse(config *ClickHouseConfig) *ClickHouse {
 
 // exec executes SQL using native protocol
 func (c *ClickHouse) exec(ctx context.Context, sql string) error {
-	// Debug: log SQL being executed
-	preview := sql
-	if len(preview) > 300 {
-		preview = preview[:300] + "..."
-	}
-	fmt.Printf("[DEBUG] Executing SQL: %s\n", preview)
-
 	// Lazy connect on first use
 	if c.conn == nil {
 		conn, err := clickhouse.Open(&clickhouse.Options{
@@ -280,18 +273,9 @@ func (c *ClickHouse) Apply(ctx context.Context, m Migration) error {
 	if c.cluster != "" {
 		content = strings.ReplaceAll(content, "{{ON_CLUSTER}}", " ON CLUSTER "+c.cluster)
 		content = strings.ReplaceAll(content, "${ON_CLUSTER}", " ON CLUSTER "+c.cluster)
-		// Debug: log first CREATE TABLE statement to verify substitution
-		if strings.Contains(content, "CREATE TABLE") {
-			firstCreate := content[strings.Index(content, "CREATE TABLE"):]
-			if idx := strings.Index(firstCreate[20:], "\n\n"); idx > 0 {
-				firstCreate = firstCreate[:20+idx]
-			}
-			fmt.Printf("[DEBUG] Sample SQL after ON_CLUSTER substitution: %s...\n", firstCreate[:min(200, len(firstCreate))])
-		}
 	} else {
 		content = strings.ReplaceAll(content, "{{ON_CLUSTER}}", "")
 		content = strings.ReplaceAll(content, "${ON_CLUSTER}", "")
-		fmt.Printf("[DEBUG] No cluster configured, removing ON_CLUSTER placeholders\n")
 	}
 
 	// Execute statements with retry logic for transient errors
