@@ -18,11 +18,42 @@ const (
 type Postgres struct {
 	db  *sql.DB
 	app string
+
+	// schema optionally sets a schema-qualified search_path for executing
+	// migrations, similar to River's `rivermigrate.Config.Schema`.
+	//
+	// When set, migrations run under:
+	//   SET LOCAL search_path = "<schema>", public
+	//
+	// Migration tracking remains in public.migrations.
+	schema string
 }
 
 // NewPostgres creates a Postgres migrator
 func NewPostgres(db *sql.DB, app string) *Postgres {
 	return &Postgres{db: db, app: app}
+}
+
+// WithSchema configures the schema to target for unqualified DDL/DML in
+// migrations (via SET LOCAL search_path). This allows embedded subsystems to
+// create tables in the host application's schema (River-style).
+func (p *Postgres) WithSchema(schema string) *Postgres {
+	p.schema = schema
+	return p
+}
+
+func quoteIdent(ident string) (string, error) {
+	ident = strings.TrimSpace(ident)
+	if ident == "" {
+		return "", fmt.Errorf("empty identifier")
+	}
+	for _, r := range ident {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return "", fmt.Errorf("invalid identifier %q", ident)
+	}
+	return `"` + ident + `"`, nil
 }
 
 // Setup ensures migration tables exist (idempotent)
@@ -93,6 +124,16 @@ func (p *Postgres) Apply(ctx context.Context, m Migration) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	if strings.TrimSpace(p.schema) != "" {
+		quoted, err := quoteIdent(p.schema)
+		if err != nil {
+			return fmt.Errorf("invalid schema %q: %w", p.schema, err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL search_path = %s, public", quoted)); err != nil {
+			return fmt.Errorf("set search_path: %w", err)
+		}
+	}
 
 	// Apply template substitution (environment variables) at execution time
 	sql := substituteTemplates(m.Content)
