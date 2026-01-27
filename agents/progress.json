@@ -1,0 +1,42 @@
+{
+  "issues": [
+    {
+      "name": "Migratekit: fix README + track ClickHouse migrations in Postgres",
+      "description": "We want to (1) update the README because it no longer matches the current code/API, and (2) change ClickHouse migration tracking/locking to use Postgres `public.migrations` + Postgres advisory locks instead of ClickHouse `migrations` + `migration_locks`.\n\nWhy:\n- ClickHouse is awkward for authoritative state (migration ledgers + locks) because it’s eventually-consistent (ReplacingMergeTree) and restore/merge semantics are part-based, not row-upsert.\n- Postgres already has a correct ledger table (`public.migrations`) with a `database` column and uniqueness `(app, database, name)`. We can reuse it for ClickHouse by writing rows with `database='clickhouse'`.\n",
+      "tasks": [
+        "=== README ===",
+        "[x] Update README examples to match current APIs:\n  - Postgres: `NewPostgres(db, app)` and `.WithSchema(schema)`\n  - ClickHouse: `NewClickHouse(&ClickHouseConfig{...})`",
+        "[x] Update README to reflect current Postgres locking:\n  - Postgres uses advisory locks (no `public.migration_locks` table)\n  - Postgres tracking table is `public.migrations` with `database='postgres'`",
+        "[x] Document new behavior: ClickHouse migrations are tracked in Postgres with `database='clickhouse'`.",
+        "",
+        "=== CLICKHOUSE TRACKING IN POSTGRES ===",
+        "[x] Add a Postgres-backed tracker/locker helper:\n  - Create/ensure `public.migrations` exists (same schema as today)\n  - List applied by `(app, database)`\n  - Record applied via INSERT/ON CONFLICT DO NOTHING\n  - Acquire/release an advisory lock dedicated to ClickHouse migrations (separate from Postgres migrations lock key).",
+        "[x] Refactor ClickHouse migrator to use the Postgres tracker:\n  - `Applied()` reads from Postgres `public.migrations` where `database='clickhouse'`\n  - `Apply()` records into Postgres after successful ClickHouse migration execution\n  - `Lock()`/`Unlock()` use Postgres advisory locks (no ClickHouse `migration_locks`).",
+        "[x] Deprecate ClickHouse tables `migrations` / `migration_locks`:\n  - Stop creating them in `ClickHouse.Setup()` when Postgres tracking is enabled (legacy tables used only for fallback)\n  - Do not auto-drop (leave cleanup to operators)\n  - Update docs to reflect deprecation.",
+        "[x] Add fallback behavior:\n  - Default/preferred: Postgres-backed tracker for ClickHouse migrations when a Postgres connection is provided.\n  - Fallback: if Postgres is not provided or is unavailable, use the legacy ClickHouse `migrations` + `migration_locks` tables.\n  - Document the behavior clearly and make it explicit in the ClickHouse constructor/config (no silent partial tracking).",
+        "",
+        "=== TESTS ===",
+        "[x] Add/extend tests for:\n  - Recording ClickHouse applied migrations into Postgres (`database='clickhouse'`).\n  - Locking uses Postgres advisory locks when PostgresDB is configured.\n  - Backward-compat story: PostgresDB absent continues to use legacy ClickHouse tracking (covered implicitly by not removing legacy code paths).",
+        "",
+        "=== HOST APP INTEGRATION NOTES ===",
+        "[x] Document required inputs for running ClickHouse migrations:\n  - ClickHouse connection config\n  - Postgres connection for tracking/locking\n  - What to do during restores (e.g. always clear/truncate any legacy `migration_locks` if it exists)."
+      ],
+      "completed": true,
+      "issue_number": 1
+    },
+    {
+      "name": "Migratekit cleanup: simplify ClickHouse + consolidate Postgres tracker",
+      "description": "Now that ClickHouse migrations are tracked+locked in Postgres only (no ClickHouse tracker tables), we can simplify migratekit:\n\nTargets:\n- Remove legacy/low-value fields/options.\n- Delete dead code from old ClickHouse lock-table era.\n- Consolidate duplicate Postgres tracking-table setup logic.\n- Keep the public API minimal and the README accurate.\n",
+      "tasks": [
+        "[x] Remove `ClickHouseConfig.LockID` and all usage (lock key derives from ClientAddr+Database+Cluster).",
+        "[x] Delete any remaining ClickHouse lock-table remnants (TTL/expiry helpers, lock SQL, constants used only by legacy `migration_locks`).",
+        "[x] Consolidate Postgres `public.migrations` DDL into one shared helper used by both `postgres.go` and `tracker_postgres.go` (avoid duplication).",
+        "[x] Tighten ClickHouse migrator:\n  - `Setup()` only ensures Postgres tracker is ready\n  - remove any leftover mode/fallback scaffolding\n  - ensure lock key is stable and scoped to cluster/db appropriately",
+        "[x] README cleanup:\n  - ensure there is no mention of ClickHouse fallback tables\n  - ensure examples match final APIs after this cleanup",
+        "[x] Verify: `go test ./...` and `go vet ./...`"
+      ],
+      "completed": true,
+      "issue_number": 2
+    }
+  ]
+}

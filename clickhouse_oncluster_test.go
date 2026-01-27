@@ -13,33 +13,33 @@ func TestOnClusterTemplateReplacement(t *testing.T) {
 		expectedOutput string
 	}{
 		{
-			name:     "With cluster - double braces",
-			cluster:  "doujins",
-			sqlInput: "CREATE TABLE foo{{ON_CLUSTER}} (id Int32)",
+			name:           "With cluster - double braces",
+			cluster:        "doujins",
+			sqlInput:       "CREATE TABLE foo{{ON_CLUSTER}} (id Int32)",
 			expectedOutput: "CREATE TABLE foo ON CLUSTER doujins (id Int32)",
 		},
 		{
-			name:     "With cluster - dollar braces",
-			cluster:  "doujins",
-			sqlInput: "CREATE TABLE foo${ON_CLUSTER} (id Int32)",
+			name:           "With cluster - dollar braces",
+			cluster:        "doujins",
+			sqlInput:       "CREATE TABLE foo${ON_CLUSTER} (id Int32)",
 			expectedOutput: "CREATE TABLE foo ON CLUSTER doujins (id Int32)",
 		},
 		{
-			name:     "Without cluster - double braces",
-			cluster:  "",
-			sqlInput: "CREATE TABLE foo{{ON_CLUSTER}} (id Int32)",
+			name:           "Without cluster - double braces",
+			cluster:        "",
+			sqlInput:       "CREATE TABLE foo{{ON_CLUSTER}} (id Int32)",
 			expectedOutput: "CREATE TABLE foo (id Int32)",
 		},
 		{
-			name:     "Without cluster - dollar braces",
-			cluster:  "",
-			sqlInput: "CREATE TABLE foo${ON_CLUSTER} (id Int32)",
+			name:           "Without cluster - dollar braces",
+			cluster:        "",
+			sqlInput:       "CREATE TABLE foo${ON_CLUSTER} (id Int32)",
 			expectedOutput: "CREATE TABLE foo (id Int32)",
 		},
 		{
-			name:     "Multiple occurrences",
-			cluster:  "prod",
-			sqlInput: "CREATE TABLE t1{{ON_CLUSTER}} (id Int32); CREATE VIEW v1{{ON_CLUSTER}} AS SELECT * FROM t1",
+			name:           "Multiple occurrences",
+			cluster:        "prod",
+			sqlInput:       "CREATE TABLE t1{{ON_CLUSTER}} (id Int32); CREATE VIEW v1{{ON_CLUSTER}} AS SELECT * FROM t1",
 			expectedOutput: "CREATE TABLE t1 ON CLUSTER prod (id Int32); CREATE VIEW v1 ON CLUSTER prod AS SELECT * FROM t1",
 		},
 	}
@@ -68,7 +68,7 @@ func TestOnClusterTemplateReplacement(t *testing.T) {
 			}
 
 			if content != tt.expectedOutput {
-				t.Errorf("Template replacement failed\nInput:    %q\nExpected: %q\nGot:      %q", 
+				t.Errorf("Template replacement failed\nInput:    %q\nExpected: %q\nGot:      %q",
 					tt.sqlInput, tt.expectedOutput, content)
 			}
 		})

@@ -2,21 +2,14 @@ package migratekit
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // ClickHouseConfig holds configuration for ClickHouse migrations
 type ClickHouseConfig struct {
@@ -25,8 +18,15 @@ type ClickHouseConfig struct {
 	Username   string
 	Password   string
 	App        string
-	LockID     string // Optional; uses DefaultLockID() if empty
 	Cluster    string // Optional; if specified, uses ON CLUSTER for DDL statements
+
+	// Required. ClickHouse migration tracking + locking is done in Postgres:
+	// - tracking: Postgres public.migrations with database='clickhouse'
+	// - locking: Postgres advisory locks
+	//
+	// This intentionally avoids ClickHouse-based migration tables (`migrations`, `migration_locks`)
+	// which are awkward to restore/merge and are not a good fit for authoritative state.
+	PostgresDB *sql.DB
 }
 
 // ClickHouse handles ClickHouse migrations via native protocol
@@ -37,28 +37,38 @@ type ClickHouse struct {
 	user    string
 	pass    string
 	app     string
-	lockID  string
 	cluster string // Optional cluster name for ON CLUSTER DDL
+
+	pgTracker *postgresTracker
 }
 
 // NewClickHouse creates a ClickHouse migrator from config.
-// If config.LockID is empty, uses DefaultLockID().
 // Uses native protocol for all connections.
 func NewClickHouse(config *ClickHouseConfig) *ClickHouse {
-	lockID := config.LockID
-	if lockID == "" {
-		lockID = DefaultLockID()
+	var pgT *postgresTracker
+	if config.PostgresDB != nil {
+		pgT = newPostgresTracker(config.PostgresDB)
 	}
 
 	return &ClickHouse{
-		addr:    config.ClientAddr,
-		db:      config.Database,
-		user:    config.Username,
-		pass:    config.Password,
-		app:     config.App,
-		lockID:  lockID,
-		cluster: config.Cluster,
+		addr:      config.ClientAddr,
+		db:        config.Database,
+		user:      config.Username,
+		pass:      config.Password,
+		app:       config.App,
+		cluster:   config.Cluster,
+		pgTracker: pgT,
 	}
+}
+
+func (c *ClickHouse) requirePostgresTracker(ctx context.Context) error {
+	if c.pgTracker == nil {
+		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking")
+	}
+	if err := c.pgTracker.Setup(ctx); err != nil {
+		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking: %w", err)
+	}
+	return nil
 }
 
 // exec executes SQL using native protocol
@@ -86,166 +96,37 @@ func (c *ClickHouse) exec(ctx context.Context, sql string) error {
 	return c.conn.Exec(ctx, sql)
 }
 
-// query returns first column as strings using native protocol
-func (c *ClickHouse) query(ctx context.Context, sql string) ([]string, error) {
-	// Lazy connect on first use
-	if c.conn == nil {
-		conn, err := clickhouse.Open(&clickhouse.Options{
-			Addr: []string{c.addr},
-			Auth: clickhouse.Auth{
-				Database: c.db,
-				Username: c.user,
-				Password: c.pass,
-			},
-			DialTimeout: 30 * time.Second,
-			Compression: &clickhouse.Compression{
-				Method: clickhouse.CompressionLZ4,
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to ClickHouse: %w", err)
-		}
-		c.conn = conn
-	}
-
-	rows, err := c.conn.Query(ctx, sql)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	// Get column metadata for proper type handling
-	columnTypes := rows.ColumnTypes()
-
-	// Create properly-typed variables using reflection
-	vars := make([]any, len(columnTypes))
-	for i := range columnTypes {
-		vars[i] = reflect.New(columnTypes[i].ScanType()).Interface()
-	}
-
-	var out []string
-	for rows.Next() {
-		// Scan into properly-typed variables
-		if err := rows.Scan(vars...); err != nil {
-			return nil, err
-		}
-		// Convert each value to string
-		for _, v := range vars {
-			// Dereference the pointer and convert to string
-			out = append(out, fmt.Sprintf("%v", reflect.ValueOf(v).Elem().Interface()))
-		}
-	}
-	return out, rows.Err()
-}
-
 // Setup ensures database and tables exist
 func (c *ClickHouse) Setup(ctx context.Context) error {
-	// NOTE: Database creation is handled by bootstrap migrations, not by migratekit.
-	// Bootstrap migrations run as default user with CREATE DATABASE permissions.
-	// App migrations run as analytics_user which only has permissions within the analytics database.
-
-	// Build ON CLUSTER clause if cluster is specified
-	onCluster := ""
-	if c.cluster != "" {
-		onCluster = " ON CLUSTER " + c.cluster
-	}
-
-	// Create migrations table
-	createMigrationsSQL := `CREATE TABLE IF NOT EXISTS migrations` + onCluster + ` (
-		app String,
-		name String,
-		migrated_at DateTime DEFAULT now()
-	) ENGINE = ReplacingMergeTree(migrated_at) ORDER BY (app, name)`
-
-	if err := c.exec(ctx, createMigrationsSQL); err != nil {
-		return err
-	}
-
-	// Create migration_locks table
-	// Note: Uses a global lock (lock_name='global') so only ONE app can migrate at a time
-	// The 'app' field records which app acquired the lock (for debugging)
-	createLocksSQL := `CREATE TABLE IF NOT EXISTS migration_locks` + onCluster + ` (
-		lock_name String,
-		app String,
-		locked_at DateTime DEFAULT now(),
-		locked_by String,
-		expires_at DateTime
-	) ENGINE = ReplacingMergeTree(locked_at) ORDER BY lock_name`
-
-	return c.exec(ctx, createLocksSQL)
+	return c.requirePostgresTracker(ctx)
 }
 
 // Applied returns list of applied migrations
 func (c *ClickHouse) Applied(ctx context.Context) ([]string, error) {
-	sql := fmt.Sprintf("SELECT name FROM migrations WHERE app = '%s' ORDER BY name",
-		strings.ReplaceAll(c.app, "'", "''"))
-	rows, err := c.query(ctx, sql)
-	if err != nil {
+	if err := c.requirePostgresTracker(ctx); err != nil {
 		return nil, err
 	}
-	return rows, nil
+	return c.pgTracker.Applied(ctx, c.app, clickhouseTrackerDatabase)
 }
 
 // Lock acquires a global database-wide migration lock
 // All apps share the same lock (lock_name='global') to prevent concurrent ClickHouse migrations
 // This is necessary because ON CLUSTER operations modify distributed DDL queue across all nodes
 func (c *ClickHouse) Lock(ctx context.Context) error {
-	maxRetries := int(lockAcquireTimeout / lockRetryInterval)
-	for i := 0; i < maxRetries; i++ {
-		// Check global lock (not per-app)
-		sql := `SELECT app, locked_by, expires_at FROM migration_locks
-			WHERE lock_name = 'global' ORDER BY locked_at DESC LIMIT 1`
-		rows, _ := c.query(ctx, sql)
-
-		canAcquire := len(rows) == 0
-		if len(rows) >= 3 {
-			if lockExpired(rows[:3], time.Now()) {
-				canAcquire = true
-			}
-		}
-
-		if canAcquire {
-			// Acquire global lock, but record which app acquired it
-			sql := fmt.Sprintf(`INSERT INTO migration_locks (lock_name, app, locked_by, locked_at, expires_at)
-				VALUES ('global', '%s', '%s', now(), '%s')`,
-				strings.ReplaceAll(c.app, "'", "''"),
-				strings.ReplaceAll(c.lockID, "'", "''"),
-				time.Now().Add(lockTTL).Format(clickhouseTimeLayout))
-			if err := c.exec(ctx, sql); err != nil {
-				return err
-			}
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(lockRetryInterval):
-		}
+	if err := c.requirePostgresTracker(ctx); err != nil {
+		return err
 	}
-	return fmt.Errorf("lock timeout")
+	key := advisoryLockKeyFromString("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
+	return c.pgTracker.Lock(ctx, key)
 }
 
 // Unlock releases the global lock
 func (c *ClickHouse) Unlock(ctx context.Context) error {
-	// Delete global lock where this app/lockID acquired it
-	sql := fmt.Sprintf("DELETE FROM migration_locks WHERE lock_name = 'global' AND app = '%s' AND locked_by = '%s'",
-		strings.ReplaceAll(c.app, "'", "''"),
-		strings.ReplaceAll(c.lockID, "'", "''"))
-	return c.exec(ctx, sql)
-}
-
-// lockExpired determines whether the provided lock row (app, locked_by, expires_at)
-// has passed its expiration time.
-func lockExpired(row []string, now time.Time) bool {
-	if len(row) < 3 {
-		return false
+	if err := c.requirePostgresTracker(ctx); err != nil {
+		return err
 	}
-	expiresAt, err := time.Parse(clickhouseTimeLayout, row[2])
-	if err != nil {
-		return false
-	}
-	return now.After(expiresAt)
+	key := advisoryLockKeyFromString("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
+	return c.pgTracker.Unlock(ctx, key)
 }
 
 // isTransientError checks if an error is likely due to distributed DDL propagation delays
@@ -315,96 +196,35 @@ func (c *ClickHouse) Apply(ctx context.Context, m Migration) error {
 		}
 	}
 
-	// Check if migration already recorded (handles concurrent migrations)
-	checkSQL := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM migrations WHERE app = '%s' AND name = '%s')",
-		strings.ReplaceAll(c.app, "'", "''"),
-		strings.ReplaceAll(Prefix(m.Name), "'", "''"))
-
-	rows, err := c.query(ctx, checkSQL)
-	if err != nil {
+	if err := c.requirePostgresTracker(ctx); err != nil {
 		return err
 	}
-
-	// If already recorded by another app, skip insertion
-	if len(rows) > 0 && rows[0] != "0" {
-		return nil
-	}
-
-	sql := fmt.Sprintf("INSERT INTO migrations (app, name) VALUES ('%s', '%s')",
-		strings.ReplaceAll(c.app, "'", "''"),
-		strings.ReplaceAll(Prefix(m.Name), "'", "''"))
-	return c.exec(ctx, sql)
+	return c.pgTracker.RecordApplied(ctx, c.app, clickhouseTrackerDatabase, Prefix(m.Name))
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed)
 // Automatically calls Setup() to ensure migration tables exist before proceeding.
 func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration) error {
-	// Ensure migration tables exist (must happen before checking applied migrations)
-	// This runs outside the lock initially to allow concurrent readers
-	applied, err := c.Applied(ctx)
-	if err != nil {
-		// If migrations table doesn't exist, set up first (CREATE TABLE IF NOT EXISTS is safe for concurrent execution)
-		errLower := strings.ToLower(err.Error())
-		if strings.Contains(errLower, "doesn't exist") || strings.Contains(errLower, "unknown table") || strings.Contains(errLower, "unknown_table") {
-			// Create the tables first using IF NOT EXISTS (safe for concurrent execution)
-			if err = c.Setup(ctx); err != nil {
-				return err
-			}
-
-			// Now acquire lock to apply migrations
-			if err = c.Lock(ctx); err != nil {
-				return err
-			}
-			defer c.Unlock(ctx)
-
-			// After setup, check applied again (still under lock)
-			applied, err = c.Applied(ctx)
-			if err != nil {
-				return err
-			}
-
-			// Filter to only unapplied migrations
-			var toApply []Migration
-			for _, mig := range migrations {
-				if !contains(applied, Prefix(mig.Name)) {
-					toApply = append(toApply, mig)
-				}
-			}
-
-			// Apply migrations (still under lock from setup)
-			for _, mig := range toApply {
-				if err = c.Apply(ctx, mig); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		}
+	if err := c.Setup(ctx); err != nil {
 		return err
 	}
 
-	// Normal path: tables exist, check what needs to be applied
+	applied, err := c.Applied(ctx)
+	if err != nil {
+		return err
+	}
+
 	var toApply []Migration
 	for _, mig := range migrations {
 		if !contains(applied, Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
 		}
 	}
-
 	if len(toApply) == 0 {
-		return nil // Nothing to do, no lock needed
+		return nil
 	}
 
-	// Ensure lock table exists before locking.
-	// It's possible for the migrations table to exist while the lock table is missing
-	// (e.g. partially-initialized databases or older migratekit versions).
-	// CREATE TABLE IF NOT EXISTS is safe for concurrent execution.
-	if err = c.Setup(ctx); err != nil {
-		return err
-	}
-
-	// Acquire lock only when we have work to do
-	if err = c.Lock(ctx); err != nil {
+	if err := c.Lock(ctx); err != nil {
 		return err
 	}
 	defer c.Unlock(ctx)
@@ -424,13 +244,11 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 		return nil
 	}
 
-	// Apply migrations (retry logic handled within Apply() method)
 	for _, mig := range toApply {
 		if err := c.Apply(ctx, mig); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -441,14 +259,6 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []Migration) error {
 	applied, err := c.Applied(ctx)
 	if err != nil {
-		// If query fails, assume table doesn't exist and no migrations applied
-		errLower := strings.ToLower(err.Error())
-		if strings.Contains(errLower, "doesn't exist") || strings.Contains(errLower, "unknown table") || strings.Contains(errLower, "unknown_table") {
-			if len(migrations) == 0 {
-				return nil // No migrations expected, validation passes
-			}
-			return fmt.Errorf("migration table does not exist - %d migrations need to be applied", len(migrations))
-		}
 		return fmt.Errorf("failed to get applied migrations: %w", err)
 	}
 

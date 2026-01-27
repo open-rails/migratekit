@@ -58,17 +58,7 @@ func quoteIdent(ident string) (string, error) {
 
 // Setup ensures migration tables exist (idempotent)
 func (p *Postgres) Setup(ctx context.Context) error {
-	_, err := p.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS public.migrations (
-			id BIGSERIAL PRIMARY KEY,
-			app TEXT NOT NULL,
-			database TEXT NOT NULL,
-			name TEXT NOT NULL,
-			migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE(app, database, name)
-		);
-	`)
-	return err
+	return ensurePublicMigrationsTable(ctx, p.db)
 }
 
 // Applied returns list of applied migration names

@@ -35,7 +35,7 @@ func main() {
     migrations, _ := migratekit.LoadFromFS(postgresFS, "migrations/postgres")
 
     // Run migrations (3 lines)
-    m := migratekit.NewPostgres(db, "doujins", "pod-123")
+    m := migratekit.NewPostgres(db, "doujins")
     m.Setup(ctx)
     m.ApplyMigrations(ctx, migrations)
 }
@@ -44,17 +44,39 @@ func main() {
 ### ClickHouse (Complete Example)
 
 ```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "embed"
+
+    "github.com/doujins-org/migratekit"
+    _ "github.com/lib/pq"
+)
+
 //go:embed migrations/clickhouse/*.sql
 var clickhouseFS embed.FS
 
 func main() {
     ctx := context.Background()
+    pg, _ := sql.Open("postgres", "postgres://...")
 
     // Load migrations from embedded FS
     migrations, _ := migratekit.LoadFromFS(clickhouseFS, "migrations/clickhouse")
 
     // Run migrations (3 lines)
-    m := migratekit.NewClickHouse(url, db, user, pass, "doujins", "pod-123")
+    m := migratekit.NewClickHouse(&migratekit.ClickHouseConfig{
+        ClientAddr: "clickhouse:9000",
+        Database:   "analytics",
+        Username:   "analytics_user",
+        Password:   "analytics_password",
+        App:        "doujins",
+
+        // ClickHouse migrations are tracked in Postgres public.migrations
+        // (database='clickhouse') and use Postgres advisory locks.
+        PostgresDB: pg,
+    })
     m.Setup(ctx)
     m.ApplyMigrations(ctx, migrations)
 }
@@ -63,7 +85,7 @@ func main() {
 ### Advanced (Manual Control)
 
 ```go
-m := migratekit.NewPostgres(db, "doujins", "pod-123")
+m := migratekit.NewPostgres(db, "doujins")
 m.Setup(ctx)
 
 applied, _ := m.Applied(ctx)  // Get list of applied migrations (no lock)
@@ -89,8 +111,8 @@ if len(toApply) > 0 {
 
 ### Primary Methods
 - `LoadFromFS(fsys, dir)` - Load migrations from embedded filesystem
-- `NewPostgres(db, app, lockID)` - Create Postgres migrator
-- `NewClickHouse(url, db, user, pass, app, lockID)` - Create ClickHouse migrator
+- `NewPostgres(db, app)` - Create Postgres migrator
+- `NewClickHouse(config)` - Create ClickHouse migrator
 - `Setup(ctx)` - Create migration tables (idempotent)
 - `ApplyMigrations(ctx, []Migration)` - Apply all pending migrations (recommended)
 
@@ -103,7 +125,7 @@ if len(toApply) > 0 {
 
 ## Schema
 
-migratekit creates two tables in `public` schema on first `Setup()`:
+migratekit creates one table in `public` schema on first `Setup()`:
 
 ```sql
 CREATE TABLE public.migrations (
@@ -114,17 +136,11 @@ CREATE TABLE public.migrations (
     migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(app, database, name)
 );
-
-CREATE TABLE public.migration_locks (
-    id BIGSERIAL PRIMARY KEY,
-    app TEXT NOT NULL,
-    database TEXT NOT NULL,
-    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    locked_by TEXT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    UNIQUE(app, database)
-);
 ```
+
+Locking:
+- Postgres uses advisory locks (no lock table).
+- ClickHouse uses Postgres advisory locks and requires `ClickHouseConfig.PostgresDB`.
 
 ## Migration Files
 
@@ -166,10 +182,10 @@ Numeric prefixes are normalized (leading zeros removed) before storage:
 
 - **Smart locking**: Only locks when there's work to do
 - **App-scoped**: Each app has independent migration sequences
-- **Auto-expiring locks**: 5-minute TTL prevents stuck locks
-- **Wait behavior**: Retries for 200s instead of failing
+- **Correct Postgres locking**: Uses Postgres advisory locks (no lock table)
+- **ClickHouse compatibility**: Runs ClickHouse DDL via native protocol; tracks applied migrations in Postgres
 - **Self-contained**: Creates own tables on first run
-- **Minimal**: ~500 lines total, stdlib only
+- **Minimal**: small codebase + minimal dependencies
 
 ## Design
 

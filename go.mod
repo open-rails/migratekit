@@ -4,7 +4,10 @@ go 1.24.0
 
 toolchain go1.24.10
 
-require github.com/ClickHouse/clickhouse-go/v2 v2.40.3
+require (
+	github.com/ClickHouse/clickhouse-go/v2 v2.40.3
+	github.com/DATA-DOG/go-sqlmock v1.5.2
+)
 
 require (
 	github.com/ClickHouse/ch-go v0.68.0 // indirect

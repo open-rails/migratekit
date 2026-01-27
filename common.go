@@ -7,16 +7,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 )
 
 const (
-	lockTTL             = 60 * time.Second
-	lockAcquireTimeout  = 90 * time.Second // Wait up to 90s to acquire lock (longer than lockTTL)
-	lockRetryInterval   = 1 * time.Second  // Check for lock availability every 1 second
-	clickhouseTimeLayout = "2006-01-02 15:04:05"
-	postgresDriver      = "postgres"
-	clickhouseDriver    = "clickhouse"
+	postgresDriver = "postgres"
 )
 
 // Migration is a single SQL migration
@@ -191,16 +185,6 @@ type MigrationSource struct {
 	FS  embed.FS
 }
 
-// DefaultLockID returns a default lock identifier based on hostname (or PID as fallback).
-// This is used by ClickHouse migrations. Postgres migrations use a global advisory lock instead.
-func DefaultLockID() string {
-	hostname, err := os.Hostname()
-	if err != nil || hostname == "" {
-		return fmt.Sprintf("pid-%d", os.Getpid())
-	}
-	return hostname
-}
-
 // ValidatePostgresMigrations validates multiple Postgres migration sources at once.
 // Returns an error if any migrations are pending.
 func ValidatePostgresMigrations(ctx context.Context, db *sql.DB, sources ...MigrationSource) error {
@@ -226,11 +210,7 @@ func ValidateClickHouseMigrations(ctx context.Context, config *ClickHouseConfig,
 		return fmt.Errorf("failed to load %s migrations: %w", config.App, err)
 	}
 
-	// Override LockID for validation
-	validatorConfig := *config
-	validatorConfig.LockID = "validator"
-
-	migrator := NewClickHouse(&validatorConfig)
+	migrator := NewClickHouse(config)
 	if err := migrator.ValidateAllApplied(ctx, migrations); err != nil {
 		return fmt.Errorf("%s migrations not applied: %w", config.App, err)
 	}
