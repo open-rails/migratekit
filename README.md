@@ -5,7 +5,7 @@ Minimal database migration library with app-scoped migrations and automatic lock
 ## Install
 
 ```bash
-go get github.com/doujins-org/migratekit
+go get github.com/openrails/migratekit
 ```
 
 ## Usage
@@ -20,7 +20,7 @@ import (
     "database/sql"
     "embed"
 
-    "github.com/doujins-org/migratekit"
+    "github.com/openrails/migratekit"
     _ "github.com/lib/pq"
 )
 
@@ -51,7 +51,7 @@ import (
     "database/sql"
     "embed"
 
-    "github.com/doujins-org/migratekit"
+    "github.com/openrails/migratekit"
     _ "github.com/lib/pq"
 )
 
