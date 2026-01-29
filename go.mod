@@ -1,4 +1,4 @@
-module github.com/doujins-org/migratekit
+module github.com/open-rails/migratekit
 
 go 1.24.0
 
