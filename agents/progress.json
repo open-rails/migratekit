@@ -60,6 +60,20 @@
       ],
       "completed": true,
       "issue_number": 3
+    },
+    {
+      "name": "v1.0.0 API freeze: define and document the stable API boundary",
+      "description": "Pre-1.0 API review (2026-06-10). Decision inputs: a usage inventory across all consumers (openrails, doujins, authkit) showing what is actually called — LoadFromFS, NewPostgres/WithSchema, ApplyMigrations, Applied, Prefix, Migration, MigrationSource, ClickHouseConfig/NewClickHouse, ValidatePostgresMigrations, ValidateClickHouseMigrations — and zero callers of Apply/Lock/Unlock/Setup/Close.\n\nDESIGN PRINCIPLE: freeze the smallest surface that covers real usage; everything dangerous-to-freeze and unused gets unexported now, while breaking is still free.\n\nCHANGES MADE BEFORE THE FREEZE:\n- Unexported Postgres.Apply / ClickHouse.Apply (single-apply bypassed the applied-set check — double-applies if misused) and Lock/Unlock on both (stateful pinned-connection locking should not be caller-driven). ApplyMigrations is the one supported path; ClickHouse.ApplyMigrations also now joins unlock errors like Postgres.\n- Generalized MigrationSource.FS and the ValidateClickHouseMigrations filesystem parameter from embed.FS to fs.FS (source-compatible; embed.FS satisfies fs.FS).\n- Kept public: Migration, Prefix, LoadFromFS, MigrationSource, ValidatePostgresMigrations, ValidateClickHouseMigrations, NewPostgres, WithSchema, Setup, Applied, ApplyMigrations, ValidateAllApplied, ClickHouseConfig, NewClickHouse, ClickHouse.{Setup,Applied,ApplyMigrations,ValidateAllApplied,Close}.\n\nThe README 'Stable API (v1)' section is the canonical boundary: full symbol tables with one-line contracts, 8 frozen behavioral contracts (tracking table shape, prefix tracking key, .up.sql discovery + numeric ordering + duplicate rejection, pinned advisory-lock serialization, template substitution rules, Postgres per-migration transactions, ClickHouse per-statement idempotency requirement, no ownership of caller's *sql.DB), a 'Removed in v1.0' list, and the compatibility policy (additive-only in v1.x; error TEXT not part of the API; v2 = new import path, very high bar).",
+      "tasks": [
+        "[x] Inventory real consumer usage across openrails/doujins/authkit to ground keep/cut decisions. Done 2026-06-10.",
+        "[x] Unexport Postgres.Apply/Lock/Unlock and ClickHouse.Apply/Lock/Unlock (zero consumers; ApplyMigrations is the supported path). Done 2026-06-10.",
+        "[x] Generalize embed.FS -> fs.FS in MigrationSource.FS and ValidateClickHouseMigrations (source-compatible). Done 2026-06-10.",
+        "[x] README 'Stable API (v1)' section: symbol tables, 8 frozen behavioral contracts, removed-in-v1.0 list, compatibility policy; quickstart examples updated (Setup call no longer needed); removed the manual-control example that used the now-private API. Done 2026-06-10.",
+        "[x] Verify: go build/vet/test green incl. live lock tests. Done 2026-06-10.",
+        "[ ] Tag v1.0.0 (owner's call) and bump consumers (openrails, doujins, authkit) from v0.7.15."
+      ],
+      "completed": false,
+      "issue_number": 4
     }
   ]
 }

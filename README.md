@@ -34,9 +34,8 @@ func main() {
     // Load migrations from embedded FS
     migrations, _ := migratekit.LoadFromFS(postgresFS, "migrations/postgres")
 
-    // Run migrations (3 lines)
+    // Run migrations (2 lines; ApplyMigrations ensures the tracking table)
     m := migratekit.NewPostgres(db, "doujins")
-    m.Setup(ctx)
     m.ApplyMigrations(ctx, migrations)
 }
 ```
@@ -77,56 +76,91 @@ func main() {
         // (database='clickhouse') and use Postgres advisory locks.
         PostgresDB: pg,
     })
-    m.Setup(ctx)
     m.ApplyMigrations(ctx, migrations)
 }
 ```
 
-### Advanced (Manual Control)
+### Startup validation (read-only)
 
 ```go
-m := migratekit.NewPostgres(db, "doujins")
-m.Setup(ctx)
-
-applied, _ := m.Applied(ctx)  // Get list of applied migrations (no lock)
-
-// Only lock if you have work to do
-var toApply []Migration
-for _, mig := range migrations {
-    if !contains(applied, prefix(mig.Name)) {
-        toApply = append(toApply, mig)
-    }
-}
-
-if len(toApply) > 0 {
-    m.Lock(ctx)
-    defer m.Unlock(ctx)
-    for _, mig := range toApply {
-        m.Apply(ctx, mig)
-    }
-}
+// Fail app startup if any migration is pending. Never creates tables.
+err := migratekit.ValidatePostgresMigrations(ctx, db,
+    migratekit.MigrationSource{App: "authkit", FS: authkitFS},
+    migratekit.MigrationSource{App: "billing", FS: billingFS},
+)
 ```
 
-## API
+## Stable API (v1)
 
-### Primary Methods
-- `LoadFromFS(fsys, dir)` - Load migrations from embedded filesystem
-- `NewPostgres(db, app)` - Create Postgres migrator
-- `NewClickHouse(config)` - Create ClickHouse migrator
-- `Setup(ctx)` - Create migration tables (idempotent)
-- `ApplyMigrations(ctx, []Migration)` - Apply all pending migrations (recommended)
+Everything in this section is the v1 compatibility boundary. Within v1.x it
+will only grow — no removals, no signature changes, no breaking behavior
+changes to the documented contracts below. Anything NOT listed here
+(unexported helpers, exact error message text, internal locking mechanics)
+is an implementation detail and may change in any release.
 
-### Advanced Methods
-- `Lock(ctx)` - Acquire the advisory lock on a dedicated pinned connection (blocks until available)
-- `Unlock(ctx)` - Release the advisory lock and the pinned connection (safe on cancelled contexts)
-- `Applied(ctx)` - List of applied migration names (`[]string`)
-- `Apply(ctx, Migration)` - Apply a single migration
-- `ValidateAllApplied(ctx, []Migration)` - Error if any migration is pending (startup gate)
+### Loading
 
-Note: the migrator never owns or closes the `*sql.DB` you pass in (the former
-`Postgres.Close()` was removed — it surprisingly closed the caller's pool).
-`ClickHouse.Close()` still exists and closes only the lazily-opened native
-connection the migrator itself created.
+| Symbol | Contract |
+|---|---|
+| `type Migration struct { Name, Content string }` | One SQL migration: filename + raw file content. |
+| `LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error)` | Loads every `*.up.sql` in `dir` (default `"."`), ordered by numeric prefix. Errors on duplicate normalized prefixes. Only the first `dir` element is used. |
+| `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.name`. |
+
+### Postgres
+
+| Symbol | Contract |
+|---|---|
+| `NewPostgres(db *sql.DB, app string) *Postgres` | Migrator for one app's migrations. Never closes `db`. |
+| `(*Postgres) WithSchema(schema string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Tracking stays in `public.migrations`. |
+| `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: ensures the tracking table, applies every unapplied migration in order under the advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
+| `(*Postgres) Applied(ctx) ([]string, error)` | Recorded migration names (normalized prefixes) for this app, `database='postgres'`. |
+| `(*Postgres) Setup(ctx) error` | Ensures `public.migrations` exists (idempotent). `ApplyMigrations` calls it for you. |
+| `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
+
+### ClickHouse
+
+| Symbol | Contract |
+|---|---|
+| `type ClickHouseConfig struct { ClientAddr, Database, Username, Password, App, Cluster string; PostgresDB *sql.DB }` | `PostgresDB` is required: tracking rows live in Postgres `public.migrations` (`database='clickhouse'`) and locking uses Postgres advisory locks. `Cluster` enables `{{ON_CLUSTER}}` expansion. |
+| `NewClickHouse(*ClickHouseConfig) *ClickHouse` | Migrator; connects to ClickHouse lazily via native protocol. |
+| `(*ClickHouse) ApplyMigrations(ctx, []Migration) error` | Same shape as Postgres. Statements run individually (no transactions) with up-to-30s retry on transient distributed-DDL errors. |
+| `(*ClickHouse) Applied(ctx) ([]string, error)` | Recorded names for this app, `database='clickhouse'`. |
+| `(*ClickHouse) Setup(ctx) error` | Ensures the Postgres tracker is ready. |
+| `(*ClickHouse) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate. |
+| `(*ClickHouse) Close() error` | Closes only the native ClickHouse connection the migrator itself opened (never `PostgresDB`). |
+
+### Multi-source startup validation
+
+| Symbol | Contract |
+|---|---|
+| `type MigrationSource struct { App string; FS fs.FS }` | One app's migration filesystem. |
+| `ValidatePostgresMigrations(ctx, db, ...MigrationSource) error` | `ValidateAllApplied` across several apps in one call. |
+| `ValidateClickHouseMigrations(ctx, *ClickHouseConfig, fs.FS) error` | Same for ClickHouse. |
+
+### Frozen behavioral contracts
+
+These behaviors are part of the API and will not change within v1.x:
+
+1. **Tracking table**: `public.migrations (id, app, database, name, migrated_at, UNIQUE(app, database, name))` with `database` ∈ {`postgres`, `clickhouse`}. Operators may query and (carefully) repair it; its shape is stable.
+2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it.
+3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
+4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
+5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `ClickHouseConfig.Cluster` (empty → removed).
+6. **Postgres atomicity**: one migration = one transaction (DDL + tracking row commit together).
+7. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
+8. **Ownership**: migrators never close a `*sql.DB` you pass in.
+
+### Removed in v1.0 (was public in v0.x)
+
+- `Postgres.Apply`, `Postgres.Lock`, `Postgres.Unlock`, `ClickHouse.Apply`, `ClickHouse.Lock`, `ClickHouse.Unlock` — the manual lock/apply path bypassed the applied-set check and made stateful locking part of the surface; `ApplyMigrations` is the supported path. (No known consumer used these.)
+- `Postgres.Close` — closed the caller's `*sql.DB`, which the migrator never owned.
+- `MigrationSource.FS` and the `ValidateClickHouseMigrations` filesystem parameter are now `fs.FS` instead of `embed.FS` (source-compatible: `embed.FS` satisfies `fs.FS`).
+
+### Compatibility policy
+
+- v1.x releases may **add** symbols, struct fields with useful zero values, and optional behavior — never remove or change what is documented above.
+- Exact error message **text** is not part of the API; only the documented error conditions are. (Typed sentinel errors may be added additively later.)
+- The module follows Go module semver: any future break means v2 with a new import path. The bar for v2 is intentionally very high.
 
 ## Schema
 

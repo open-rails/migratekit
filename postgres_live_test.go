@@ -120,26 +120,26 @@ func TestPostgres_LockUnlockPinned(t *testing.T) {
 	defer db.Close()
 
 	p := NewPostgres(db, "migratekit-locktest")
-	if err := p.Lock(ctx); err != nil {
+	if err := p.lock(ctx); err != nil {
 		t.Fatalf("lock: %v", err)
 	}
-	if err := p.Lock(ctx); err == nil {
+	if err := p.lock(ctx); err == nil {
 		t.Fatal("double lock should error")
 	}
-	if err := p.Unlock(ctx); err != nil {
+	if err := p.unlock(ctx); err != nil {
 		t.Fatalf("unlock: %v", err)
 	}
-	if err := p.Unlock(ctx); err == nil {
+	if err := p.unlock(ctx); err == nil {
 		t.Fatal("double unlock should error")
 	}
 
 	// A cancelled context must not prevent release (Unlock uses WithoutCancel).
-	if err := p.Lock(ctx); err != nil {
+	if err := p.lock(ctx); err != nil {
 		t.Fatalf("relock: %v", err)
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := p.Unlock(cancelled); err != nil {
+	if err := p.unlock(cancelled); err != nil {
 		t.Fatalf("unlock with cancelled ctx: %v", err)
 	}
 }
@@ -183,12 +183,12 @@ func TestPostgres_LockSurvivesPoolInterleaving(t *testing.T) {
 	}()
 
 	for i := 0; i < 50; i++ {
-		if err := p.Lock(ctx); err != nil {
+		if err := p.lock(ctx); err != nil {
 			t.Fatalf("iteration %d: lock: %v", i, err)
 		}
 		// Interleave pool usage while the lock is held.
 		_, _ = db.ExecContext(ctx, `SELECT 1`)
-		if err := p.Unlock(ctx); err != nil {
+		if err := p.unlock(ctx); err != nil {
 			t.Fatalf("iteration %d: unlock: %v (lock/unlock landed on different pooled connections)", i, err)
 		}
 	}

@@ -3,9 +3,9 @@ package migratekit
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 )
@@ -240,10 +240,11 @@ func splitSQL(sql string) []string {
 	return out
 }
 
-// MigrationSource represents a migration source with an app name and embedded filesystem
+// MigrationSource represents a migration source with an app name and a
+// migration filesystem (any fs.FS; embed.FS satisfies it).
 type MigrationSource struct {
 	App string
-	FS  embed.FS
+	FS  fs.FS
 }
 
 // ValidatePostgresMigrations validates multiple Postgres migration sources at once.
@@ -265,8 +266,8 @@ func ValidatePostgresMigrations(ctx context.Context, db *sql.DB, sources ...Migr
 
 // ValidateClickHouseMigrations validates ClickHouse migrations.
 // Returns an error if any migrations are pending.
-func ValidateClickHouseMigrations(ctx context.Context, config *ClickHouseConfig, fs embed.FS) error {
-	migrations, err := LoadFromFS(fs)
+func ValidateClickHouseMigrations(ctx context.Context, config *ClickHouseConfig, fsys fs.FS) error {
+	migrations, err := LoadFromFS(fsys)
 	if err != nil {
 		return fmt.Errorf("failed to load %s migrations: %w", config.App, err)
 	}

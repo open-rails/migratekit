@@ -3,6 +3,7 @@ package migratekit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -109,10 +110,10 @@ func (c *ClickHouse) Applied(ctx context.Context) ([]string, error) {
 	return c.pgTracker.Applied(ctx, c.app, clickhouseTrackerDatabase)
 }
 
-// Lock acquires a global database-wide migration lock
-// All apps share the same lock (lock_name='global') to prevent concurrent ClickHouse migrations
-// This is necessary because ON CLUSTER operations modify distributed DDL queue across all nodes
-func (c *ClickHouse) Lock(ctx context.Context) error {
+// lock acquires a global database-wide migration lock.
+// All apps share the same lock to prevent concurrent ClickHouse migrations.
+// This is necessary because ON CLUSTER operations modify distributed DDL queue across all nodes.
+func (c *ClickHouse) lock(ctx context.Context) error {
 	if err := c.requirePostgresTracker(ctx); err != nil {
 		return err
 	}
@@ -120,8 +121,8 @@ func (c *ClickHouse) Lock(ctx context.Context) error {
 	return c.pgTracker.Lock(ctx, key)
 }
 
-// Unlock releases the global lock
-func (c *ClickHouse) Unlock(ctx context.Context) error {
+// unlock releases the global lock
+func (c *ClickHouse) unlock(ctx context.Context) error {
 	if err := c.requirePostgresTracker(ctx); err != nil {
 		return err
 	}
@@ -143,8 +144,10 @@ func isTransientError(err error) bool {
 		strings.Contains(errStr, "Table") && strings.Contains(errStr, "doesn't exist")
 }
 
-// Apply applies a migration with exponential backoff retry for transient errors
-func (c *ClickHouse) Apply(ctx context.Context, m Migration) error {
+// applyOne applies a migration with exponential backoff retry for transient
+// errors. Callers must hold the lock and filter applied migrations first
+// (see ApplyMigrations).
+func (c *ClickHouse) applyOne(ctx context.Context, m Migration) error {
 	// First apply generic template substitution (environment variables, etc.)
 	content, err := substituteTemplates(m.Content)
 	if err != nil {
@@ -207,7 +210,7 @@ func (c *ClickHouse) Apply(ctx context.Context, m Migration) error {
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed)
 // Automatically calls Setup() to ensure migration tables exist before proceeding.
-func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration) error {
+func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration) (err error) {
 	if err := c.Setup(ctx); err != nil {
 		return err
 	}
@@ -227,10 +230,14 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 		return nil
 	}
 
-	if err := c.Lock(ctx); err != nil {
+	if err := c.lock(ctx); err != nil {
 		return err
 	}
-	defer c.Unlock(ctx)
+	defer func() {
+		if unlockErr := c.unlock(ctx); unlockErr != nil {
+			err = errors.Join(err, unlockErr)
+		}
+	}()
 
 	// Double-check under lock in case another process applied some since our first read
 	applied, err = c.Applied(ctx)
@@ -248,7 +255,7 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 	}
 
 	for _, mig := range toApply {
-		if err := c.Apply(ctx, mig); err != nil {
+		if err := c.applyOne(ctx, mig); err != nil {
 			return err
 		}
 	}

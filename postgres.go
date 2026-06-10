@@ -92,11 +92,11 @@ func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
 	return names, rows.Err()
 }
 
-// Lock acquires the global advisory lock for migrations on a dedicated,
+// lock acquires the global advisory lock for migrations on a dedicated,
 // pinned connection. It blocks until the lock is available. The pinned
-// connection is held until Unlock; if the process dies, Postgres releases
+// connection is held until unlock; if the process dies, Postgres releases
 // the session lock when the connection drops.
-func (p *Postgres) Lock(ctx context.Context) error {
+func (p *Postgres) lock(ctx context.Context) error {
 	p.lockMu.Lock()
 	defer p.lockMu.Unlock()
 	if p.lockConn != nil {
@@ -114,11 +114,11 @@ func (p *Postgres) Lock(ctx context.Context) error {
 	return nil
 }
 
-// Unlock releases the global advisory lock and the pinned connection. It
+// unlock releases the global advisory lock and the pinned connection. It
 // runs with a non-cancellable context so a cancelled migration still
 // releases the lock; closing the pinned connection is the safety net that
 // releases the session lock even if pg_advisory_unlock itself fails.
-func (p *Postgres) Unlock(ctx context.Context) error {
+func (p *Postgres) unlock(ctx context.Context) error {
 	p.lockMu.Lock()
 	defer p.lockMu.Unlock()
 	if p.lockConn == nil {
@@ -141,8 +141,10 @@ func (p *Postgres) Unlock(ctx context.Context) error {
 	return closeErr
 }
 
-// Apply applies a single migration
-func (p *Postgres) Apply(ctx context.Context, m Migration) error {
+// applyOne applies a single migration without checking the applied set or
+// taking the lock; callers must hold the lock and filter applied
+// migrations first (see ApplyMigrations).
+func (p *Postgres) applyOne(ctx context.Context, m Migration) error {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -207,11 +209,11 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	}
 
 	// Acquire lock only when we have work to do
-	if err := p.Lock(ctx); err != nil {
+	if err := p.lock(ctx); err != nil {
 		return err
 	}
 	defer func() {
-		if unlockErr := p.Unlock(ctx); unlockErr != nil {
+		if unlockErr := p.unlock(ctx); unlockErr != nil {
 			err = errors.Join(err, unlockErr)
 		}
 	}()
@@ -229,7 +231,7 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	}
 
 	for _, mig := range toApply {
-		if err := p.Apply(ctx, mig); err != nil {
+		if err := p.applyOne(ctx, mig); err != nil {
 			return err
 		}
 	}
