@@ -70,7 +70,8 @@
         "[x] Generalize embed.FS -> fs.FS in MigrationSource.FS and ValidateClickHouseMigrations (source-compatible). Done 2026-06-10.",
         "[x] README 'Stable API (v1)' section: symbol tables, 8 frozen behavioral contracts, removed-in-v1.0 list, compatibility policy; quickstart examples updated (Setup call no longer needed); removed the manual-control example that used the now-private API. Done 2026-06-10.",
         "[x] Verify: go build/vet/test green incl. live lock tests. Done 2026-06-10.",
-        "[ ] Tag v1.0.0 (owner's call) and bump consumers (openrails, doujins, authkit) from v0.7.15."
+        "[x] Tag v1.0.0. Done 2026-06-10: annotated tag pushed (commit c562847); authkit bumped v0.7.15 -> v1.0.0 with full test suite green against the new version.",
+        "[ ] Bump openrails and doujins from v0.7.15 to v1.0.0 in their own repos (compatibility pre-verified: neither uses any symbol removed in v1.0, and neither has duplicate migration prefixes)."
       ],
       "completed": false,
       "issue_number": 4
