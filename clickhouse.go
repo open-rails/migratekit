@@ -146,7 +146,10 @@ func isTransientError(err error) bool {
 // Apply applies a migration with exponential backoff retry for transient errors
 func (c *ClickHouse) Apply(ctx context.Context, m Migration) error {
 	// First apply generic template substitution (environment variables, etc.)
-	content := substituteTemplates(m.Content)
+	content, err := substituteTemplates(m.Content)
+	if err != nil {
+		return fmt.Errorf("migration %s: %w", m.Name, err)
+	}
 
 	// Inject ON_CLUSTER template variable for user migrations.
 	// This allows migrations to use {{ON_CLUSTER}} or ${ON_CLUSTER} which expands

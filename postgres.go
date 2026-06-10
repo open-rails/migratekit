@@ -3,8 +3,10 @@ package migratekit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 const (
@@ -27,6 +29,14 @@ type Postgres struct {
 	//
 	// Migration tracking remains in public.migrations.
 	schema string
+
+	// lockConn pins the session that holds the advisory lock. Session
+	// advisory locks belong to the CONNECTION that acquired them, so Lock and
+	// Unlock must run on the same pinned *sql.Conn — issuing them through the
+	// *sql.DB pool can acquire on one pooled connection and "release" on
+	// another, leaking the real lock until the first connection is recycled.
+	lockMu   sync.Mutex
+	lockConn *sql.Conn
 }
 
 // NewPostgres creates a Postgres migrator
@@ -82,29 +92,53 @@ func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
 	return names, rows.Err()
 }
 
-// Lock acquires a global advisory lock for migrations
-// This blocks until the lock is available (no polling needed)
-// The lock is automatically released when the connection closes
+// Lock acquires the global advisory lock for migrations on a dedicated,
+// pinned connection. It blocks until the lock is available. The pinned
+// connection is held until Unlock; if the process dies, Postgres releases
+// the session lock when the connection drops.
 func (p *Postgres) Lock(ctx context.Context) error {
-	_, err := p.db.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, globalMigrationLockKey)
+	p.lockMu.Lock()
+	defer p.lockMu.Unlock()
+	if p.lockConn != nil {
+		return fmt.Errorf("migration advisory lock already held")
+	}
+	conn, err := p.db.Conn(ctx)
 	if err != nil {
+		return fmt.Errorf("acquire connection for migration advisory lock: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, int64(globalMigrationLockKey)); err != nil {
+		_ = conn.Close()
 		return fmt.Errorf("acquire global migration advisory lock: %w", err)
 	}
+	p.lockConn = conn
 	return nil
 }
 
-// Unlock releases the global advisory lock
+// Unlock releases the global advisory lock and the pinned connection. It
+// runs with a non-cancellable context so a cancelled migration still
+// releases the lock; closing the pinned connection is the safety net that
+// releases the session lock even if pg_advisory_unlock itself fails.
 func (p *Postgres) Unlock(ctx context.Context) error {
+	p.lockMu.Lock()
+	defer p.lockMu.Unlock()
+	if p.lockConn == nil {
+		return fmt.Errorf("migration advisory lock not held")
+	}
+	ctx = context.WithoutCancel(ctx)
+
 	var unlocked bool
-	err := p.db.QueryRowContext(ctx,
-		`SELECT pg_advisory_unlock($1)`, globalMigrationLockKey).Scan(&unlocked)
+	err := p.lockConn.QueryRowContext(ctx,
+		`SELECT pg_advisory_unlock($1)`, int64(globalMigrationLockKey)).Scan(&unlocked)
+	closeErr := p.lockConn.Close() // releases the session lock even on unlock failure
+	p.lockConn = nil
+
 	if err != nil {
-		return fmt.Errorf("release global migration advisory lock: %w", err)
+		return errors.Join(fmt.Errorf("release global migration advisory lock: %w", err), closeErr)
 	}
 	if !unlocked {
-		return fmt.Errorf("advisory lock was not held")
+		return errors.Join(fmt.Errorf("advisory lock was not held"), closeErr)
 	}
-	return nil
+	return closeErr
 }
 
 // Apply applies a single migration
@@ -126,7 +160,10 @@ func (p *Postgres) Apply(ctx context.Context, m Migration) error {
 	}
 
 	// Apply template substitution (environment variables) at execution time
-	sql := substituteTemplates(m.Content)
+	sql, err := substituteTemplates(m.Content)
+	if err != nil {
+		return fmt.Errorf("migration %s: %w", m.Name, err)
+	}
 	if _, err := tx.ExecContext(ctx, sql); err != nil {
 		return err
 	}
@@ -141,60 +178,30 @@ func (p *Postgres) Apply(ctx context.Context, m Migration) error {
 	return tx.Commit()
 }
 
-// ApplyMigrations applies all unapplied migrations (only locks if needed)
-// Automatically calls Setup() to ensure migration tables exist before proceeding.
-func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) error {
-	// Ensure migration tables exist (must happen before checking applied migrations)
-	// This runs outside the lock initially to allow concurrent readers
+// ApplyMigrations applies all unapplied migrations (only locks if needed).
+// Setup() always runs first, so there is no missing-table special case.
+func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) (err error) {
+	// CREATE TABLE IF NOT EXISTS is cheap and almost always a no-op. Two
+	// replicas racing the very first Setup can hit Postgres's known
+	// concurrent-create race (duplicate key on pg_type/pg_class); one retry
+	// resolves it because the loser then sees the winner's table.
+	if err := p.Setup(ctx); err != nil {
+		if err = p.Setup(ctx); err != nil {
+			return err
+		}
+	}
+
 	applied, err := p.Applied(ctx)
 	if err != nil {
-		// If migrations table doesn't exist, set up first (CREATE TABLE IF NOT EXISTS is safe for concurrent execution)
-		if strings.Contains(err.Error(), "does not exist") {
-			// Create the tables first using IF NOT EXISTS (safe for concurrent execution)
-			if err := p.Setup(ctx); err != nil {
-				return err
-			}
-
-			// Now acquire lock to apply migrations
-			if err := p.Lock(ctx); err != nil {
-				return err
-			}
-			defer p.Unlock(ctx)
-
-			// After setup, check applied again (still under lock)
-			applied, err = p.Applied(ctx)
-			if err != nil {
-				return err
-			}
-
-			// Filter to only unapplied migrations
-			var toApply []Migration
-			for _, mig := range migrations {
-				if !contains(applied, Prefix(mig.Name)) {
-					toApply = append(toApply, mig)
-				}
-			}
-
-			// Apply migrations (still under lock from setup)
-			for _, mig := range toApply {
-				if err := p.Apply(ctx, mig); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		}
 		return err
 	}
 
-	// Normal path: tables exist, check what needs to be applied
 	var toApply []Migration
 	for _, mig := range migrations {
 		if !contains(applied, Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
 		}
 	}
-
 	if len(toApply) == 0 {
 		return nil // Nothing to do, no lock needed
 	}
@@ -203,7 +210,11 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	if err := p.Lock(ctx); err != nil {
 		return err
 	}
-	defer p.Unlock(ctx)
+	defer func() {
+		if unlockErr := p.Unlock(ctx); unlockErr != nil {
+			err = errors.Join(err, unlockErr)
+		}
+	}()
 
 	// Double-check under lock in case another process applied some since our first read
 	applied, err = p.Applied(ctx)
@@ -216,11 +227,7 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 			toApply = append(toApply, mig)
 		}
 	}
-	if len(toApply) == 0 {
-		return nil
-	}
 
-	// Apply migrations
 	for _, mig := range toApply {
 		if err := p.Apply(ctx, mig); err != nil {
 			return err
@@ -238,7 +245,7 @@ func (p *Postgres) ValidateAllApplied(ctx context.Context, migrations []Migratio
 	applied, err := p.Applied(ctx)
 	if err != nil {
 		// If the migrations table doesn't exist, no migrations have been applied
-		if strings.Contains(err.Error(), "does not exist") {
+		if isUndefinedTable(err) {
 			if len(migrations) == 0 {
 				return nil // No migrations expected, validation passes
 			}
@@ -266,9 +273,4 @@ func (p *Postgres) ValidateAllApplied(ctx context.Context, migrations []Migratio
 	}
 
 	return nil
-}
-
-// Close closes the database connection
-func (p *Postgres) Close() error {
-	return p.db.Close()
 }

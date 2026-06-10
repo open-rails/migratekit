@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -65,14 +66,34 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
-// substituteTemplates replaces template variables in SQL with environment variable values.
-// Supports two template formats:
+// isUndefinedTable reports whether err is Postgres SQLSTATE 42P01
+// (undefined_table). Both lib/pq (*pq.Error) and pgx (*pgconn.PgError)
+// expose SQLState(); the message-substring check remains as a fallback for
+// drivers that don't (and is what older migratekit versions relied on).
+func isUndefinedTable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var stateErr interface{ SQLState() string }
+	if errors.As(err, &stateErr) {
+		return stateErr.SQLState() == "42P01"
+	}
+	return strings.Contains(err.Error(), "does not exist")
+}
+
+// substituteTemplates replaces template variables in SQL with environment
+// variable values. Supports two template formats:
 //   - {{VAR_NAME}} (Handlebars/Mustache style)
 //   - ${VAR_NAME} (Shell/JS template literal style)
 //
-// Empty templates like ${} or {{}} are skipped (no substitution).
-// Example: {{CLICKHOUSE_PASSWORD}} -> os.Getenv("CLICKHOUSE_PASSWORD")
-func substituteTemplates(sql string) string {
+// A referenced variable that is NOT SET in the environment is an error — a
+// silent empty-string substitution would ship e.g. an empty password into
+// DDL on a typo'd name. A variable explicitly set to the empty string is
+// substituted as-is (assumed intentional).
+//
+// Empty templates like ${} or {{}} are skipped (no substitution), and
+// ON_CLUSTER placeholders are left intact for ClickHouse.Apply to expand.
+func substituteTemplates(sql string) (string, error) {
 	result := sql
 	start := 0
 
@@ -128,8 +149,11 @@ func substituteTemplates(sql string) string {
 			continue
 		}
 
-		// Get environment variable value
-		value := os.Getenv(varName)
+		// Get environment variable value; unset is an error (see doc comment).
+		value, set := os.LookupEnv(varName)
+		if !set {
+			return "", fmt.Errorf("template variable %s is referenced but the environment variable is not set", varName)
+		}
 
 		// Replace template with value
 		result = result[:openIdx] + value + result[closeIdx+closeLen:]
@@ -138,44 +162,81 @@ func substituteTemplates(sql string) string {
 		start = openIdx + len(value)
 	}
 
-	return result
+	return result, nil
 }
 
-// splitSQL splits SQL into statements, removing comments
+// splitSQL splits SQL into statements and strips comments. It is
+// quote-aware: semicolons and comment markers inside '...' strings,
+// "..." identifiers, and `...` identifiers are preserved verbatim
+// (including '' doubled-quote and backslash escapes inside strings).
 func splitSQL(sql string) []string {
 	sql = strings.ReplaceAll(sql, "\r\n", "\n")
 	sql = strings.ReplaceAll(sql, "\r", "\n")
 
-	// Remove block comments
-	for {
-		if i := strings.Index(sql, "/*"); i >= 0 {
-			if j := strings.Index(sql[i+2:], "*/"); j >= 0 {
-				sql = sql[:i] + sql[i+j+4:]
-			} else {
-				sql = sql[:i]
-				break
-			}
-		} else {
-			break
-		}
-	}
-
-	// Remove line comments
-	var b strings.Builder
-	for _, line := range strings.Split(sql, "\n") {
-		if t := strings.TrimSpace(line); !strings.HasPrefix(t, "--") && t != "" {
-			b.WriteString(line)
-			b.WriteByte('\n')
-		}
-	}
-
-	// Split by semicolon
 	var out []string
-	for _, stmt := range strings.Split(b.String(), ";") {
-		if s := strings.TrimSpace(stmt); s != "" {
+	var b strings.Builder
+	i, n := 0, len(sql)
+
+	flush := func() {
+		if s := strings.TrimSpace(b.String()); s != "" {
 			out = append(out, s)
 		}
+		b.Reset()
 	}
+
+	for i < n {
+		c := sql[i]
+		switch {
+		case c == '\'' || c == '"' || c == '`':
+			// Copy the quoted region verbatim.
+			quote := c
+			b.WriteByte(c)
+			i++
+			for i < n {
+				ch := sql[i]
+				b.WriteByte(ch)
+				i++
+				if ch == '\\' && quote == '\'' && i < n {
+					// Backslash escape (ClickHouse-style strings).
+					b.WriteByte(sql[i])
+					i++
+					continue
+				}
+				if ch == quote {
+					if i < n && sql[i] == quote {
+						// Doubled quote escape ('' or "" or ``).
+						b.WriteByte(sql[i])
+						i++
+						continue
+					}
+					break
+				}
+			}
+		case c == '-' && i+1 < n && sql[i+1] == '-':
+			// Line comment: skip to end of line.
+			for i < n && sql[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && sql[i+1] == '*':
+			// Block comment: skip to closing */ (or end of input).
+			i += 2
+			for i+1 < n && !(sql[i] == '*' && sql[i+1] == '/') {
+				i++
+			}
+			if i+1 < n {
+				i += 2
+			} else {
+				i = n
+			}
+		case c == ';':
+			flush()
+			i++
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	flush()
 	return out
 }
 

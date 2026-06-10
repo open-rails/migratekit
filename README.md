@@ -117,11 +117,16 @@ if len(toApply) > 0 {
 - `ApplyMigrations(ctx, []Migration)` - Apply all pending migrations (recommended)
 
 ### Advanced Methods
-- `Lock(ctx)` - Acquire lock (waits up to 200s)
-- `Unlock(ctx)` - Release lock
+- `Lock(ctx)` - Acquire the advisory lock on a dedicated pinned connection (blocks until available)
+- `Unlock(ctx)` - Release the advisory lock and the pinned connection (safe on cancelled contexts)
 - `Applied(ctx)` - List of applied migration names (`[]string`)
 - `Apply(ctx, Migration)` - Apply a single migration
-- `Close()` - Cleanup
+- `ValidateAllApplied(ctx, []Migration)` - Error if any migration is pending (startup gate)
+
+Note: the migrator never owns or closes the `*sql.DB` you pass in (the former
+`Postgres.Close()` was removed — it surprisingly closed the caller's pool).
+`ClickHouse.Close()` still exists and closes only the lazily-opened native
+connection the migrator itself created.
 
 ## Schema
 
@@ -139,8 +144,14 @@ CREATE TABLE public.migrations (
 ```
 
 Locking:
-- Postgres uses advisory locks (no lock table).
-- ClickHouse uses Postgres advisory locks and requires `ClickHouseConfig.PostgresDB`.
+- Postgres uses advisory locks (no lock table). The lock is acquired and
+  released on a single dedicated connection pinned for the lock's lifetime —
+  session advisory locks belong to the connection that took them, so going
+  through the pool would acquire on one connection and "release" on another.
+  If the process dies mid-migration, Postgres releases the lock when the
+  pinned connection drops.
+- ClickHouse uses Postgres advisory locks (same pinning) and requires
+  `ClickHouseConfig.PostgresDB`.
 
 ## Migration Files
 
@@ -177,6 +188,34 @@ create_users.up.sql         # Missing numeric prefix
 Numeric prefixes are normalized (leading zeros removed) before storage:
 - `001`, `01`, `1` all become `"1"`
 - `042`, `42` both become `"42"`
+
+**Ordering:** migrations apply in numeric-prefix order (`2_x` before `10_x`),
+not lexical filename order, so unpadded prefixes are safe.
+
+**Duplicate prefixes are rejected:** because tracking is keyed by the
+normalized prefix, two files sharing a prefix (`002_users.up.sql` +
+`002_roles.up.sql`, or `0042_x` vs `42_y`) would mean the second silently
+never runs. `LoadFromFS` returns an error instead.
+
+## Template Variables
+
+Migration SQL may reference environment variables as `{{VAR_NAME}}` or
+`${VAR_NAME}`; they are substituted at execution time. A referenced variable
+that is **not set** is an error — silent empty-string substitution previously
+meant a typo'd `{{CLICKHOUSE_PASWORD}}` shipped an empty password into DDL. A
+variable explicitly set to the empty string is substituted as-is. `{{ON_CLUSTER}}`
+is special-cased for ClickHouse (expanded from `ClickHouseConfig.Cluster`).
+Avoid `${...}`/`{{...}}` sequences in migration SQL that are not meant as
+templates.
+
+## ClickHouse Semantics
+
+ClickHouse has no transactional DDL. A multi-statement migration that fails
+partway leaves the earlier statements applied and the migration **unrecorded**,
+so the rerun re-executes them. Every statement in a ClickHouse migration must
+therefore be individually idempotent (`CREATE TABLE IF NOT EXISTS`,
+`DROP ... IF EXISTS`, etc.). Statements are split on `;` with full awareness
+of string literals and comments, so semicolons inside quoted strings are safe.
 
 ## Features
 

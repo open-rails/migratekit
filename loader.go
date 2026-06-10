@@ -4,11 +4,16 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
 	"strings"
 )
 
 // LoadFromFS loads migrations from an embedded filesystem.
-// Reads all .up.sql files, sorted by name.
+// Reads all .up.sql files, ordered by numeric prefix (so unpadded names like
+// 2_x and 10_x apply in numeric order), falling back to filename order for
+// non-numeric names. Returns an error if two files normalize to the same
+// Prefix() — tracking is prefix-keyed, so a duplicate prefix would silently
+// skip the second file as "already applied".
 // If dir is empty, defaults to "." (root of the filesystem).
 func LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error) {
 	directory := "."
@@ -21,10 +26,17 @@ func LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error) {
 	}
 
 	var migrations []Migration
+	seen := map[string]string{} // normalized prefix -> filename
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".up.sql") {
 			continue
 		}
+
+		prefix := Prefix(entry.Name())
+		if prior, dup := seen[prefix]; dup {
+			return nil, fmt.Errorf("duplicate migration prefix %q: %s and %s (tracking is prefix-keyed; the second file would be silently skipped)", prefix, prior, entry.Name())
+		}
+		seen[prefix] = entry.Name()
 
 		// Construct path correctly for embed.FS
 		// embed.FS doesn't accept "./" prefix, so handle "." specially
@@ -47,10 +59,32 @@ func LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error) {
 		})
 	}
 
-	// Sort by filename (001_, 002_, etc.)
+	// Numeric prefixes sort numerically (1, 2, 10 — not 1, 10, 2);
+	// non-numeric names sort after numeric ones, lexically.
 	sort.Slice(migrations, func(i, j int) bool {
-		return migrations[i].Name < migrations[j].Name
+		ni, iNum := numericPrefix(migrations[i].Name)
+		nj, jNum := numericPrefix(migrations[j].Name)
+		switch {
+		case iNum && jNum:
+			if ni != nj {
+				return ni < nj
+			}
+			return migrations[i].Name < migrations[j].Name
+		case iNum:
+			return true
+		case jNum:
+			return false
+		default:
+			return migrations[i].Name < migrations[j].Name
+		}
 	})
 
 	return migrations, nil
+}
+
+// numericPrefix parses the normalized Prefix() of a migration filename as an
+// integer. ok is false for names without a numeric prefix.
+func numericPrefix(name string) (n int64, ok bool) {
+	n, err := strconv.ParseInt(Prefix(name), 10, 64)
+	return n, err == nil
 }
