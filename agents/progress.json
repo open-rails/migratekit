@@ -71,9 +71,9 @@
         "[x] README 'Stable API (v1)' section: symbol tables, 8 frozen behavioral contracts, removed-in-v1.0 list, compatibility policy; quickstart examples updated (Setup call no longer needed); removed the manual-control example that used the now-private API. Done 2026-06-10.",
         "[x] Verify: go build/vet/test green incl. live lock tests. Done 2026-06-10.",
         "[x] Tag v1.0.0. Done 2026-06-10: annotated tag pushed (commit c562847); authkit bumped v0.7.15 -> v1.0.0 with full test suite green against the new version.",
-        "[ ] Bump openrails and doujins from v0.7.15 to v1.0.0 in their own repos (compatibility pre-verified: neither uses any symbol removed in v1.0, and neither has duplicate migration prefixes)."
+        "[x] Bump all consumers to v1.0.0. Done 2026-06-10: authkit, openrails, doujins, gen-orchestrator, tensorhub (master), hentai0 (feat-external-payment-mirror), cozy-art (rebuild) — each pre-verified for removed-API usage (none), duplicate migration prefixes (none), and template variables (only the special-cased ON_CLUSTER); all build green and pushed. tensorhub also migrated off the renamed github.com/doujins-org/migratekit module path (was pinned to v0.7.13). doujins-billing-old intentionally skipped: archived (-old suffix, no commits in 6 months), still on doujins-org v0.7.8."
       ],
-      "completed": false,
+      "completed": true,
       "issue_number": 4
     }
   ]
