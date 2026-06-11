@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -72,28 +74,35 @@ func (c *ClickHouse) requirePostgresTracker(ctx context.Context) error {
 	return nil
 }
 
+// connect lazily opens the native connection on first use.
+func (c *ClickHouse) connect() error {
+	if c.conn != nil {
+		return nil
+	}
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{c.addr},
+		Auth: clickhouse.Auth{
+			Database: c.db,
+			Username: c.user,
+			Password: c.pass,
+		},
+		DialTimeout: 30 * time.Second,
+		Compression: &clickhouse.Compression{
+			Method: clickhouse.CompressionLZ4,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect to ClickHouse: %w", err)
+	}
+	c.conn = conn
+	return nil
+}
+
 // exec executes SQL using native protocol
 func (c *ClickHouse) exec(ctx context.Context, sql string) error {
-	// Lazy connect on first use
-	if c.conn == nil {
-		conn, err := clickhouse.Open(&clickhouse.Options{
-			Addr: []string{c.addr},
-			Auth: clickhouse.Auth{
-				Database: c.db,
-				Username: c.user,
-				Password: c.pass,
-			},
-			DialTimeout: 30 * time.Second,
-			Compression: &clickhouse.Compression{
-				Method: clickhouse.CompressionLZ4,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("failed to connect to ClickHouse: %w", err)
-		}
-		c.conn = conn
+	if err := c.connect(); err != nil {
+		return err
 	}
-
 	return c.conn.Exec(ctx, sql)
 }
 
@@ -144,6 +153,165 @@ func isTransientError(err error) bool {
 		strings.Contains(errStr, "Table") && strings.Contains(errStr, "doesn't exist")
 }
 
+// staleReplicaPattern extracts the table znode path and replica name from a
+// REPLICA_ALREADY_EXISTS message, e.g.
+//
+//	DB::Exception: Replica /clickhouse/tables/analytics/session_links/replicas/replica1 already exists.
+var staleReplicaPattern = regexp.MustCompile(`Replica\s+(\S+)/replicas/([^\s/]+)\s+already exists`)
+
+// staleReplicaInfo reports whether err is a ClickHouse REPLICA_ALREADY_EXISTS
+// (code 253) error and, if so, returns the table's Keeper znode path and the
+// replica name it collided on.
+func staleReplicaInfo(err error) (zkPath, replica string, ok bool) {
+	if err == nil {
+		return "", "", false
+	}
+	var ex *clickhouse.Exception
+	if errors.As(err, &ex) {
+		if ex.Code != 253 {
+			return "", "", false
+		}
+	} else if !strings.Contains(err.Error(), "REPLICA_ALREADY_EXISTS") {
+		return "", "", false
+	}
+	m := staleReplicaPattern.FindStringSubmatch(err.Error())
+	if m == nil {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// isAccessDenied reports a ClickHouse privileges error (code 497).
+func isAccessDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ex *clickhouse.Exception
+	if errors.As(err, &ex) && ex.Code == 497 {
+		return true
+	}
+	return strings.Contains(err.Error(), "ACCESS_DENIED") ||
+		strings.Contains(err.Error(), "Not enough privileges")
+}
+
+// replicaOwner returns the live local table (as "db.table") that currently
+// owns the given Keeper replica registration, or "" if no live table owns it.
+func (c *ClickHouse) replicaOwner(ctx context.Context, zkPath, replica string) (string, error) {
+	if err := c.connect(); err != nil {
+		return "", err
+	}
+	rows, err := c.conn.Query(ctx,
+		"SELECT database, table FROM system.replicas WHERE zookeeper_path = ? AND replica_name = ?",
+		zkPath, replica)
+	if err != nil {
+		return "", fmt.Errorf("check system.replicas for %s: %w", zkPath, err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var db, table string
+		if scanErr := rows.Scan(&db, &table); scanErr != nil {
+			return "(unknown)", nil
+		}
+		return db + "." + table, nil
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("check system.replicas for %s: %w", zkPath, err)
+	}
+	return "", nil
+}
+
+// dropStaleReplica removes an orphaned Keeper replica registration so the
+// caller can retry the CREATE that collided with it (REPLICA_ALREADY_EXISTS).
+//
+// This situation arises when ClickHouse's local state and Keeper's get out of
+// sync — e.g. the ClickHouse data volume was wiped (or the migration tracker
+// was reset and migrations re-ran) while Keeper kept the old znodes, or an
+// earlier non-SYNC DROP left the znode to Atomic-database delayed cleanup and
+// a later migration re-creates the table inside that window. It is safe to
+// self-heal because the replica name is THIS server's own identity (the
+// {replica} macro): no other live server can legitimately hold it. Callers
+// must have verified no live local table owns the registration (replicaOwner);
+// ClickHouse itself also refuses SYSTEM DROP REPLICA for a replica backed by a
+// local table, so the live case stays fail-closed.
+func (c *ClickHouse) dropStaleReplica(ctx context.Context, zkPath, replica string) error {
+	esc := func(s string) string { return strings.ReplaceAll(s, "'", "\\'") }
+	log.Printf("migratekit: dropping stale ClickHouse replica %q at %s (no local table owns it)", replica, zkPath)
+	return c.exec(ctx, fmt.Sprintf("SYSTEM DROP REPLICA '%s' FROM ZKPATH '%s'", esc(replica), esc(zkPath)))
+}
+
+// execStatements runs every statement of an already-templated migration with
+// the retry policy:
+//   - exponential backoff for transient distributed-DDL errors,
+//   - REPLICA_ALREADY_EXISTS (253) with NO live owner: a stale Keeper znode
+//     (partial volume wipe, or a non-SYNC DROP's delayed cleanup) — drop our
+//     own orphaned registration once and retry immediately,
+//   - REPLICA_ALREADY_EXISTS with a live owner: another writer just created
+//     the (shared) table — back off and retry; IF NOT EXISTS no-ops once the
+//     winner's table is visible.
+func (c *ClickHouse) execStatements(ctx context.Context, name, content string) error {
+	// Snuba retries up to 30s for synchronization issues
+	const maxRetryDuration = 30 * time.Second
+	for _, stmt := range splitSQL(content) {
+		startTime := time.Now()
+		backoff := 1 * time.Second
+		droppedStaleReplica := false
+
+		for {
+			err := c.exec(ctx, stmt)
+			if err == nil {
+				break // Success
+			}
+
+			if zkPath, replica, ok := staleReplicaInfo(err); ok {
+				owner, ownerErr := c.replicaOwner(ctx, zkPath, replica)
+				if ownerErr != nil {
+					if !isAccessDenied(ownerErr) {
+						return fmt.Errorf("migration %s: %w (stale-replica recovery failed: %v)", name, err, ownerErr)
+					}
+					// No SELECT on system.replicas — skip the courtesy check and
+					// rely on ClickHouse's own guard: SYSTEM DROP REPLICA refuses
+					// replicas backed by a live local table.
+					owner = ""
+				}
+				if owner == "" {
+					// Ghost znode. Drop it once and retry the statement; a
+					// second 253 after that is a real problem.
+					if droppedStaleReplica {
+						return fmt.Errorf("migration %s: %w (replica still exists after dropping it once)", name, err)
+					}
+					droppedStaleReplica = true
+					if dropErr := c.dropStaleReplica(ctx, zkPath, replica); dropErr != nil {
+						return fmt.Errorf("migration %s: %w (stale-replica recovery failed: %v)", name, err, dropErr)
+					}
+					continue
+				}
+				// Live owner: fall through to the backoff path below and retry.
+				log.Printf("migratekit: replica %q at %s is owned by live table %s; retrying (concurrent create?)", replica, zkPath, owner)
+			} else if !isTransientError(err) {
+				return err // Permanent error, don't retry
+			}
+
+			// Check if we've exceeded total retry duration
+			if time.Since(startTime) >= maxRetryDuration {
+				return fmt.Errorf("migration failed after %v of retries: %w", maxRetryDuration, err)
+			}
+
+			// Wait with exponential backoff (1s, 2s, 4s, 8s, 16s)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+
+			backoff *= 2
+			if backoff > 16*time.Second {
+				backoff = 16 * time.Second // Cap at 16 seconds
+			}
+		}
+	}
+	return nil
+}
+
 // applyOne applies a migration with exponential backoff retry for transient
 // errors. Callers must hold the lock and filter applied migrations first
 // (see ApplyMigrations).
@@ -165,41 +333,8 @@ func (c *ClickHouse) applyOne(ctx context.Context, m Migration) error {
 		content = strings.ReplaceAll(content, "${ON_CLUSTER}", "")
 	}
 
-	// Execute statements with retry logic for transient errors
-	// Snuba retries up to 30s for synchronization issues
-	const maxRetryDuration = 30 * time.Second
-	for _, stmt := range splitSQL(content) {
-		startTime := time.Now()
-		backoff := 1 * time.Second
-
-		for {
-			err := c.exec(ctx, stmt)
-			if err == nil {
-				break // Success
-			}
-
-			// Check if this is a transient error worth retrying
-			if !isTransientError(err) {
-				return err // Permanent error, don't retry
-			}
-
-			// Check if we've exceeded total retry duration
-			if time.Since(startTime) >= maxRetryDuration {
-				return fmt.Errorf("migration failed after %v of retries: %w", maxRetryDuration, err)
-			}
-
-			// Wait with exponential backoff (1s, 2s, 4s, 8s, 16s)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-
-			backoff *= 2
-			if backoff > 16*time.Second {
-				backoff = 16 * time.Second // Cap at 16 seconds
-			}
-		}
+	if err := c.execStatements(ctx, m.Name, content); err != nil {
+		return err
 	}
 
 	if err := c.requirePostgresTracker(ctx); err != nil {
