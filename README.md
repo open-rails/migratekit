@@ -37,6 +37,14 @@ func main() {
     // Run migrations (2 lines; ApplyMigrations ensures the tracking table)
     m := migratekit.NewPostgres(db, "doujins")
     m.ApplyMigrations(ctx, migrations)
+
+    // Optional: target a configured schema. Unqualified migration SQL runs
+    // under SET LOCAL search_path = "<schema>", public.
+    m = migratekit.NewPostgres(db, "doujins").WithSchema(cfg.DB.Schema)
+
+    // Optional: if migrations are authored with hard-qualified canonical DDL,
+    // rewrite that app-owned schema to the configured schema while applying.
+    m = migratekit.NewPostgres(db, "openrails").WithSchema(cfg.DB.Schema, "openrails")
 }
 ```
 
@@ -111,7 +119,7 @@ is an implementation detail and may change in any release.
 | Symbol | Contract |
 |---|---|
 | `NewPostgres(db *sql.DB, app string) *Postgres` | Migrator for one app's migrations. Never closes `db`. |
-| `(*Postgres) WithSchema(schema string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Tracking stays in `public.migrations`. |
+| `(*Postgres) WithSchema(schema string, rewriteFrom ...string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Optional `rewriteFrom` canonical schema names are rewritten to `schema` in migration SQL before execution, for portable hard-qualified app DDL such as `openrails.foo`. Tracking stays in `public.migrations`. |
 | `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: ensures the tracking table, applies every unapplied migration in order under the advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
 | `(*Postgres) Applied(ctx) ([]string, error)` | Recorded migration names (normalized prefixes) for this app, `database='postgres'`. |
 | `(*Postgres) Setup(ctx) error` | Ensures `public.migrations` exists (idempotent). `ApplyMigrations` calls it for you. |
@@ -134,7 +142,7 @@ is an implementation detail and may change in any release.
 | Symbol | Contract |
 |---|---|
 | `type MigrationSource struct { App string; FS fs.FS }` | One app's migration filesystem. |
-| `ValidatePostgresMigrations(ctx, db, ...MigrationSource) error` | `ValidateAllApplied` across several apps in one call. |
+| `ValidatePostgresMigrations(ctx, db, ...MigrationSource) error` | `ValidateAllApplied` across several apps in one call. `MigrationSource.Schema` and `RewriteFrom` mirror `WithSchema` for schema-aware callers. |
 | `ValidateClickHouseMigrations(ctx, *ClickHouseConfig, fs.FS) error` | Same for ClickHouse. |
 
 ### Frozen behavioral contracts
@@ -147,6 +155,7 @@ These behaviors are part of the API and will not change within v1.x:
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `ClickHouseConfig.Cluster` (empty → removed).
 6. **Postgres atomicity**: one migration = one transaction (DDL + tracking row commit together).
+7. **Postgres schema targeting**: `WithSchema(schema)` sets a per-migration transaction search path for unqualified SQL. `WithSchema(schema, "canonical")` also rewrites app-owned canonical schema references to `schema` before execution; use this for portable hard-qualified DDL, not for shared schemas like `public`.
 7. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
 8. **Ownership**: migrators never close a `*sql.DB` you pass in.
 

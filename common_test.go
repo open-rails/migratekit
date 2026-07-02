@@ -79,11 +79,49 @@ func TestSubstituteTemplates(t *testing.T) {
 	}
 }
 
+func TestRewriteSchemaRefs(t *testing.T) {
+	in := strings.Join([]string{
+		"CREATE SCHEMA IF NOT EXISTS openrails;",
+		"CREATE TABLE openrails.merchants (id uuid REFERENCES openrails.merchants);",
+		"DROP INDEX IF EXISTS openrails.idx_reconciliation_findings_open;",
+		"GRANT USAGE ON SCHEMA openrails TO openrails_app;",
+	}, "\n")
+
+	got, err := rewriteSchemaRefs(in, "shop", []string{"openrails"})
+	if err != nil {
+		t.Fatalf("rewriteSchemaRefs: %v", err)
+	}
+	want := strings.Join([]string{
+		"CREATE SCHEMA IF NOT EXISTS shop;",
+		"CREATE TABLE shop.merchants (id uuid REFERENCES shop.merchants);",
+		"DROP INDEX IF EXISTS shop.idx_reconciliation_findings_open;",
+		"GRANT USAGE ON SCHEMA shop TO openrails_app;",
+	}, "\n")
+	if got != want {
+		t.Fatalf("rewrite mismatch:\n got: %s\nwant: %s", got, want)
+	}
+
+	unchanged, err := rewriteSchemaRefs(in, "openrails", []string{"openrails"})
+	if err != nil {
+		t.Fatalf("same-schema rewrite: %v", err)
+	}
+	if unchanged != in {
+		t.Fatalf("same-schema rewrite changed SQL:\n%s", unchanged)
+	}
+
+	if _, err := rewriteSchemaRefs(in, "bad-schema", []string{"openrails"}); err == nil {
+		t.Fatal("invalid target schema should error")
+	}
+	if _, err := rewriteSchemaRefs(in, "shop", []string{"bad-schema"}); err == nil {
+		t.Fatal("invalid source schema should error")
+	}
+}
+
 func TestSplitSQL_QuoteAware(t *testing.T) {
 	cases := []struct {
-		name  string
-		in    string
-		want  []string
+		name string
+		in   string
+		want []string
 	}{
 		{
 			"semicolon in string literal",

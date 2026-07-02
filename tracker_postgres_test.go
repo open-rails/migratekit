@@ -20,6 +20,10 @@ func TestPostgresTracker_Basics(t *testing.T) {
 
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("migrations_app_database_schema_name_key").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	if err := tr.Setup(ctx); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -72,6 +76,10 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 
 	// Setup() must succeed without touching ClickHouse migration tables when PostgresDB is provided.
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("migrations_app_database_schema_name_key").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ch := NewClickHouse(&ClickHouseConfig{

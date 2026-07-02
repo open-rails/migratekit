@@ -168,7 +168,7 @@ func substituteTemplates(sql string) (string, error) {
 // splitSQL splits SQL into statements and strips comments. It is
 // quote-aware: semicolons and comment markers inside '...' strings,
 // "..." identifiers, and `...` identifiers are preserved verbatim
-// (including '' doubled-quote and backslash escapes inside strings).
+// (including ” doubled-quote and backslash escapes inside strings).
 func splitSQL(sql string) []string {
 	sql = strings.ReplaceAll(sql, "\r\n", "\n")
 	sql = strings.ReplaceAll(sql, "\r", "\n")
@@ -245,6 +245,11 @@ func splitSQL(sql string) []string {
 type MigrationSource struct {
 	App string
 	FS  fs.FS
+	// Schema optionally mirrors Postgres.WithSchema for validation helpers.
+	// RewriteFrom carries canonical schema names to rewrite when applying via
+	// Postgres.WithSchema(schema, rewriteFrom...).
+	Schema      string
+	RewriteFrom []string
 }
 
 // ValidatePostgresMigrations validates multiple Postgres migration sources at once.
@@ -257,6 +262,9 @@ func ValidatePostgresMigrations(ctx context.Context, db *sql.DB, sources ...Migr
 		}
 
 		migrator := NewPostgres(db, source.App)
+		if source.Schema != "" || len(source.RewriteFrom) > 0 {
+			migrator.WithSchema(source.Schema, source.RewriteFrom...)
+		}
 		if err := migrator.ValidateAllApplied(ctx, migrations); err != nil {
 			return fmt.Errorf("%s migrations not applied: %w", source.App, err)
 		}

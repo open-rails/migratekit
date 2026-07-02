@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -29,6 +30,11 @@ type Postgres struct {
 	//
 	// Migration tracking remains in public.migrations.
 	schema string
+	// schemaRewriteFrom optionally rewrites references to canonical schema
+	// names in migration SQL before execution. This is for migrations authored
+	// with hard-qualified app-owned DDL, e.g. openrails.foo, that should relocate
+	// with WithSchema("tenant", "openrails").
+	schemaRewriteFrom []string
 
 	// lockConn pins the session that holds the advisory lock. Session
 	// advisory locks belong to the CONNECTION that acquired them, so Lock and
@@ -44,11 +50,22 @@ func NewPostgres(db *sql.DB, app string) *Postgres {
 	return &Postgres{db: db, app: app}
 }
 
-// WithSchema configures the schema to target for unqualified DDL/DML in
-// migrations (via SET LOCAL search_path). This allows embedded subsystems to
-// create tables in the host application's schema (River-style).
-func (p *Postgres) WithSchema(schema string) *Postgres {
+// WithSchema configures the schema to target for migrations.
+//
+// Unqualified DDL/DML runs under:
+//
+//	SET LOCAL search_path = "<schema>", public
+//
+// Passing one or more canonical schema names also rewrites those schema
+// references in migration SQL before execution. This lets apps author portable
+// hard-qualified DDL against a default schema and relocate it at runtime:
+//
+//	migratekit.NewPostgres(db, "app").WithSchema(cfg.Schema, "openrails")
+//
+// Tracking always stays in public.migrations.
+func (p *Postgres) WithSchema(schema string, rewriteFrom ...string) *Postgres {
 	p.schema = schema
+	p.schemaRewriteFrom = append([]string(nil), rewriteFrom...)
 	return p
 }
 
@@ -66,6 +83,29 @@ func quoteIdent(ident string) (string, error) {
 	return `"` + ident + `"`, nil
 }
 
+func rewriteSchemaRefs(sqlText, target string, from []string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" || len(from) == 0 {
+		return sqlText, nil
+	}
+	if _, err := quoteIdent(target); err != nil {
+		return "", fmt.Errorf("invalid target schema %q: %w", target, err)
+	}
+	out := sqlText
+	for _, schema := range from {
+		schema = strings.TrimSpace(schema)
+		if schema == "" || schema == target {
+			continue
+		}
+		if _, err := quoteIdent(schema); err != nil {
+			return "", fmt.Errorf("invalid source schema %q: %w", schema, err)
+		}
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(schema) + `\b`)
+		out = re.ReplaceAllString(out, target)
+	}
+	return out, nil
+}
+
 // Setup ensures migration tables exist (idempotent)
 func (p *Postgres) Setup(ctx context.Context) error {
 	return ensurePublicMigrationsTable(ctx, p.db)
@@ -73,9 +113,11 @@ func (p *Postgres) Setup(ctx context.Context) error {
 
 // Applied returns list of applied migration names
 func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
+	// Match this schema's rows plus legacy schema-less rows (schema=''), which
+	// predate the schema column and belong to whatever schema this app targets.
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT name FROM public.migrations WHERE app = $1 AND database = $2 ORDER BY name`,
-		p.app, postgresDriver)
+		`SELECT name FROM public.migrations WHERE app = $1 AND database = $2 AND (schema = $3 OR schema = '') ORDER BY name`,
+		p.app, postgresDriver, p.schema)
 	if err != nil {
 		return nil, err
 	}
@@ -166,14 +208,18 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration) error {
 	if err != nil {
 		return fmt.Errorf("migration %s: %w", m.Name, err)
 	}
+	sql, err = rewriteSchemaRefs(sql, p.schema, p.schemaRewriteFrom)
+	if err != nil {
+		return fmt.Errorf("migration %s: %w", m.Name, err)
+	}
 	if _, err := tx.ExecContext(ctx, sql); err != nil {
 		return err
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, name) VALUES ($1, $2, $3)
-		 ON CONFLICT (app, database, name) DO NOTHING`,
-		p.app, postgresDriver, Prefix(m.Name)); err != nil {
+		`INSERT INTO public.migrations (app, database, schema, name) VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (app, database, schema, name) DO NOTHING`,
+		p.app, postgresDriver, p.schema, Prefix(m.Name)); err != nil {
 		return err
 	}
 
