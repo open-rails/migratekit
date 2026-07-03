@@ -113,10 +113,11 @@ func (p *Postgres) Setup(ctx context.Context) error {
 
 // Applied returns list of applied migration names
 func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
-	// Match this schema's rows plus legacy schema-less rows (schema=''), which
-	// predate the schema column and belong to whatever schema this app targets.
+	// Exact schema match only. schema='' is the stamp for no-WithSchema groups,
+	// never a wildcard: a WithSchema group must not accept schema-less rows as
+	// proof of application (that silently skips migrations for the new schema).
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT name FROM public.migrations WHERE app = $1 AND database = $2 AND (schema = $3 OR schema = '') ORDER BY name`,
+		`SELECT name FROM public.migrations WHERE app = $1 AND database = $2 AND schema = $3 ORDER BY name`,
 		p.app, postgresDriver, p.schema)
 	if err != nil {
 		return nil, err
@@ -273,6 +274,20 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	for _, mig := range migrations {
 		if !contains(applied, Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
+		}
+	}
+
+	// The target schema must exist BEFORE search_path is set: Postgres silently
+	// drops missing schemas from search_path, which would land unqualified DDL
+	// in public instead of erroring. Under the advisory lock, so replicas can't
+	// race the create.
+	if len(toApply) > 0 && strings.TrimSpace(p.schema) != "" {
+		quoted, err := quoteIdent(p.schema)
+		if err != nil {
+			return fmt.Errorf("invalid schema %q: %w", p.schema, err)
+		}
+		if _, err := p.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
+			return fmt.Errorf("ensure schema %s: %w", p.schema, err)
 		}
 	}
 

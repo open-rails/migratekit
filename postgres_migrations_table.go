@@ -9,8 +9,8 @@ import (
 // identity includes `schema` because WithSchema places tables in different
 // schemas of the SAME database: without it, the same app applied to two schemas
 // (e.g. doujins.* and hentai0.* sharing one DB) would record under one identity
-// and the second schema would never get its tables. Legacy rows predate the
-// column (schema=”); Applied() matches them via a compatibility clause.
+// and the second schema would never get its tables. schema=” is the stamp for
+// no-WithSchema groups only — Applied() matches schemas exactly, no wildcard.
 func ensurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	// Fresh installs get the full shape (constraint auto-named
 	// migrations_app_database_schema_name_key).

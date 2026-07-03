@@ -35,11 +35,8 @@ func TestPostgres_SchemaAwareTracking(t *testing.T) {
 	}
 	cleanup()
 	defer cleanup()
-	for _, s := range []string{s1, s2, s3} {
-		if _, err := db.ExecContext(ctx, `CREATE SCHEMA `+s); err != nil {
-			t.Fatalf("create schema %s: %v", s, err)
-		}
-	}
+	// Schemas are deliberately NOT pre-created: ApplyMigrations must create the
+	// target schema itself (missing schemas silently fall out of search_path).
 
 	// Same migration (unqualified table) applied to two schemas under one app.
 	mig := []Migration{{Name: "001_widget.up.sql", Content: `CREATE TABLE widget (id int);`}}
@@ -60,17 +57,17 @@ func TestPostgres_SchemaAwareTracking(t *testing.T) {
 		t.Fatalf("re-apply s1: %v", err)
 	}
 
-	// Backward compatibility: a legacy schema-less row (predates the column)
-	// must be honored as applied, so the migration is NOT re-run for s3.
+	// Hard cut: a schema-less row is the stamp for no-WithSchema groups, NOT a
+	// wildcard. It must not count as applied for s3, so s3 gets the table.
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO public.migrations (app, database, name) VALUES ($1, 'postgres', '1')`, app); err != nil {
-		t.Fatalf("seed legacy row: %v", err)
+		t.Fatalf("seed schema-less row: %v", err)
 	}
 	if err := NewPostgres(db, app).WithSchema(s3).ApplyMigrations(ctx, mig); err != nil {
 		t.Fatalf("apply s3: %v", err)
 	}
-	if tableExists(t, db, s3, "widget") {
-		t.Fatal("s3 got the table despite a legacy applied-row — compat clause not honored")
+	if !tableExists(t, db, s3, "widget") {
+		t.Fatal("s3 missing widget table — schema-less row wrongly matched a WithSchema group")
 	}
 }
 
