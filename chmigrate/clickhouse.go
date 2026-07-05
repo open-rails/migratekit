@@ -1,4 +1,12 @@
-package migratekit
+// Package chmigrate is migratekit's ClickHouse migration driver. It lives in
+// its own package (and imports github.com/ClickHouse/clickhouse-go/v2) so that
+// consumers who only need migratekit's Postgres migrator never pull in the
+// ClickHouse client: Go's module graph pruning drops clickhouse-go/ch-go from
+// a consumer's build list once nothing in that consumer imports this package.
+//
+// See the root package's README for the full migration-file/template-variable
+// contract; this package covers only what's specific to ClickHouse.
+package chmigrate
 
 import (
 	"context"
@@ -12,10 +20,15 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
+	"github.com/open-rails/migratekit"
+	"github.com/open-rails/migratekit/internal/coremigrate"
 )
 
-// ClickHouseConfig holds configuration for ClickHouse migrations
-type ClickHouseConfig struct {
+const clickhouseTrackerDatabase = "clickhouse"
+
+// Config holds configuration for ClickHouse migrations.
+type Config struct {
 	ClientAddr string // Native protocol address (e.g., clickhouse:9000)
 	Database   string
 	Username   string
@@ -32,7 +45,7 @@ type ClickHouseConfig struct {
 	PostgresDB *sql.DB
 }
 
-// ClickHouse handles ClickHouse migrations via native protocol
+// ClickHouse handles ClickHouse migrations via native protocol.
 type ClickHouse struct {
 	conn    driver.Conn // ClickHouse native connection
 	addr    string
@@ -42,33 +55,33 @@ type ClickHouse struct {
 	app     string
 	cluster string // Optional cluster name for ON CLUSTER DDL
 
-	pgTracker *postgresTracker
+	tracker *coremigrate.Tracker
 }
 
-// NewClickHouse creates a ClickHouse migrator from config.
+// New creates a ClickHouse migrator from config.
 // Uses native protocol for all connections.
-func NewClickHouse(config *ClickHouseConfig) *ClickHouse {
-	var pgT *postgresTracker
+func New(config *Config) *ClickHouse {
+	var tr *coremigrate.Tracker
 	if config.PostgresDB != nil {
-		pgT = newPostgresTracker(config.PostgresDB)
+		tr = coremigrate.NewTracker(config.PostgresDB)
 	}
 
 	return &ClickHouse{
-		addr:      config.ClientAddr,
-		db:        config.Database,
-		user:      config.Username,
-		pass:      config.Password,
-		app:       config.App,
-		cluster:   config.Cluster,
-		pgTracker: pgT,
+		addr:    config.ClientAddr,
+		db:      config.Database,
+		user:    config.Username,
+		pass:    config.Password,
+		app:     config.App,
+		cluster: config.Cluster,
+		tracker: tr,
 	}
 }
 
-func (c *ClickHouse) requirePostgresTracker(ctx context.Context) error {
-	if c.pgTracker == nil {
+func (c *ClickHouse) requireTracker(ctx context.Context) error {
+	if c.tracker == nil {
 		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking")
 	}
-	if err := c.pgTracker.Setup(ctx); err != nil {
+	if err := c.tracker.Setup(ctx); err != nil {
 		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking: %w", err)
 	}
 	return nil
@@ -108,35 +121,35 @@ func (c *ClickHouse) exec(ctx context.Context, sql string) error {
 
 // Setup ensures database and tables exist
 func (c *ClickHouse) Setup(ctx context.Context) error {
-	return c.requirePostgresTracker(ctx)
+	return c.requireTracker(ctx)
 }
 
 // Applied returns list of applied migrations
 func (c *ClickHouse) Applied(ctx context.Context) ([]string, error) {
-	if err := c.requirePostgresTracker(ctx); err != nil {
+	if err := c.requireTracker(ctx); err != nil {
 		return nil, err
 	}
-	return c.pgTracker.Applied(ctx, c.app, clickhouseTrackerDatabase)
+	return c.tracker.Applied(ctx, c.app, clickhouseTrackerDatabase)
 }
 
 // lock acquires a global database-wide migration lock.
 // All apps share the same lock to prevent concurrent ClickHouse migrations.
 // This is necessary because ON CLUSTER operations modify distributed DDL queue across all nodes.
 func (c *ClickHouse) lock(ctx context.Context) error {
-	if err := c.requirePostgresTracker(ctx); err != nil {
+	if err := c.requireTracker(ctx); err != nil {
 		return err
 	}
-	key := advisoryLockKeyFromString("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
-	return c.pgTracker.Lock(ctx, key)
+	key := coremigrate.AdvisoryLockKey("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
+	return c.tracker.Lock(ctx, key)
 }
 
 // unlock releases the global lock
 func (c *ClickHouse) unlock(ctx context.Context) error {
-	if err := c.requirePostgresTracker(ctx); err != nil {
+	if err := c.requireTracker(ctx); err != nil {
 		return err
 	}
-	key := advisoryLockKeyFromString("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
-	return c.pgTracker.Unlock(ctx, key)
+	key := coremigrate.AdvisoryLockKey("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
+	return c.tracker.Unlock(ctx, key)
 }
 
 // isTransientError checks if an error is likely due to distributed DDL propagation delays
@@ -315,9 +328,9 @@ func (c *ClickHouse) execStatements(ctx context.Context, name, content string) e
 // applyOne applies a migration with exponential backoff retry for transient
 // errors. Callers must hold the lock and filter applied migrations first
 // (see ApplyMigrations).
-func (c *ClickHouse) applyOne(ctx context.Context, m Migration) error {
+func (c *ClickHouse) applyOne(ctx context.Context, m migratekit.Migration) error {
 	// First apply generic template substitution (environment variables, etc.)
-	content, err := substituteTemplates(m.Content)
+	content, err := coremigrate.SubstituteTemplates(m.Content)
 	if err != nil {
 		return fmt.Errorf("migration %s: %w", m.Name, err)
 	}
@@ -337,15 +350,15 @@ func (c *ClickHouse) applyOne(ctx context.Context, m Migration) error {
 		return err
 	}
 
-	if err := c.requirePostgresTracker(ctx); err != nil {
+	if err := c.requireTracker(ctx); err != nil {
 		return err
 	}
-	return c.pgTracker.RecordApplied(ctx, c.app, clickhouseTrackerDatabase, Prefix(m.Name))
+	return c.tracker.RecordApplied(ctx, c.app, clickhouseTrackerDatabase, migratekit.Prefix(m.Name))
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed)
 // Automatically calls Setup() to ensure migration tables exist before proceeding.
-func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration) (err error) {
+func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migratekit.Migration) (err error) {
 	if err := c.Setup(ctx); err != nil {
 		return err
 	}
@@ -355,9 +368,9 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 		return err
 	}
 
-	var toApply []Migration
+	var toApply []migratekit.Migration
 	for _, mig := range migrations {
-		if !contains(applied, Prefix(mig.Name)) {
+		if !coremigrate.Contains(applied, migratekit.Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
 		}
 	}
@@ -381,7 +394,7 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 	}
 	toApply = toApply[:0]
 	for _, mig := range migrations {
-		if !contains(applied, Prefix(mig.Name)) {
+		if !coremigrate.Contains(applied, migratekit.Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
 		}
 	}
@@ -401,7 +414,7 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []Migration
 // Returns an error listing any pending migrations if validation fails.
 // This is intended for use during application startup to ensure the database
 // schema is up-to-date before the app starts serving requests.
-func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []Migration) error {
+func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []migratekit.Migration) error {
 	applied, err := c.Applied(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get applied migrations: %w", err)
@@ -416,7 +429,7 @@ func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []Migrat
 	// Check which migrations are pending
 	var pending []string
 	for _, mig := range migrations {
-		if !appliedMap[Prefix(mig.Name)] {
+		if !appliedMap[migratekit.Prefix(mig.Name)] {
 			pending = append(pending, mig.Name)
 		}
 	}

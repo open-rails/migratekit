@@ -1,4 +1,4 @@
-package migratekit
+package coremigrate
 
 import (
 	"context"
@@ -9,31 +9,31 @@ import (
 	"sync"
 )
 
-const (
-	clickhouseTrackerDatabase = "clickhouse"
-)
-
-type postgresTracker struct {
+// Tracker records applied migrations and takes advisory locks in Postgres,
+// for migrators whose target database is not Postgres itself (e.g.
+// ClickHouse): the durable record and locking live in Postgres regardless of
+// what's being migrated.
+type Tracker struct {
 	db *sql.DB
 
-	// lockConn pins the session holding the advisory lock; see Postgres.lockConn.
+	// lockConn pins the session holding the advisory lock; see Tracker.Lock.
 	lockMu   sync.Mutex
 	lockConn *sql.Conn
 	lockKey  int64
 }
 
-func newPostgresTracker(db *sql.DB) *postgresTracker {
-	return &postgresTracker{db: db}
+func NewTracker(db *sql.DB) *Tracker {
+	return &Tracker{db: db}
 }
 
-func (t *postgresTracker) Setup(ctx context.Context) error {
+func (t *Tracker) Setup(ctx context.Context) error {
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
-	return ensurePublicMigrationsTable(ctx, t.db)
+	return EnsurePublicMigrationsTable(ctx, t.db)
 }
 
-func (t *postgresTracker) Applied(ctx context.Context, app string, database string) ([]string, error) {
+func (t *Tracker) Applied(ctx context.Context, app string, database string) ([]string, error) {
 	if t == nil || t.db == nil {
 		return nil, fmt.Errorf("postgres tracker: db is nil")
 	}
@@ -57,7 +57,7 @@ func (t *postgresTracker) Applied(ctx context.Context, app string, database stri
 	return names, rows.Err()
 }
 
-func (t *postgresTracker) RecordApplied(ctx context.Context, app string, database string, name string) error {
+func (t *Tracker) RecordApplied(ctx context.Context, app string, database string, name string) error {
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
@@ -71,7 +71,7 @@ func (t *postgresTracker) RecordApplied(ctx context.Context, app string, databas
 // Lock acquires the advisory lock for key on a dedicated, pinned connection
 // (session advisory locks belong to the connection that took them; going
 // through the pool would acquire and release on different connections).
-func (t *postgresTracker) Lock(ctx context.Context, key int64) error {
+func (t *Tracker) Lock(ctx context.Context, key int64) error {
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
@@ -96,7 +96,7 @@ func (t *postgresTracker) Lock(ctx context.Context, key int64) error {
 // Unlock releases the advisory lock on the pinned connection, then closes it.
 // Runs with a non-cancellable context; closing the connection releases the
 // session lock even if pg_advisory_unlock fails.
-func (t *postgresTracker) Unlock(ctx context.Context, key int64) error {
+func (t *Tracker) Unlock(ctx context.Context, key int64) error {
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
@@ -125,7 +125,8 @@ func (t *postgresTracker) Unlock(ctx context.Context, key int64) error {
 	return closeErr
 }
 
-func advisoryLockKeyFromString(s string) int64 {
+// AdvisoryLockKey derives a stable advisory-lock key from an arbitrary string.
+func AdvisoryLockKey(s string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte("migratekit:"))
 	_, _ = h.Write([]byte(s))

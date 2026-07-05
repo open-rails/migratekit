@@ -1,4 +1,4 @@
-package migratekit
+package chmigrate
 
 import (
 	"context"

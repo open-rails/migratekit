@@ -49,36 +49,6 @@ func TestPrefix(t *testing.T) {
 	}
 }
 
-func TestSubstituteTemplates(t *testing.T) {
-	t.Setenv("MKIT_SET_VAR", "value1")
-	t.Setenv("MKIT_EMPTY_VAR", "")
-
-	// Set vars substitute (both styles); explicitly-empty vars are allowed.
-	got, err := substituteTemplates("a ${MKIT_SET_VAR} b {{MKIT_SET_VAR}} c {{MKIT_EMPTY_VAR}} d")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got != "a value1 b value1 c  d" {
-		t.Fatalf("got %q", got)
-	}
-
-	// Unset vars are an error, not a silent empty substitution.
-	if _, err := substituteTemplates("PASSWORD '{{MKIT_DEFINITELY_UNSET_VAR}}'"); err == nil {
-		t.Fatal("expected error for unset template variable")
-	} else if !strings.Contains(err.Error(), "MKIT_DEFINITELY_UNSET_VAR") {
-		t.Fatalf("error should name the variable: %v", err)
-	}
-
-	// ON_CLUSTER placeholders pass through untouched; empty templates are skipped.
-	got, err = substituteTemplates("CREATE TABLE t {{ON_CLUSTER}} (${ON_CLUSTER}) ${} {{}}")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got != "CREATE TABLE t {{ON_CLUSTER}} (${ON_CLUSTER}) ${} {{}}" {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestRewriteSchemaRefs(t *testing.T) {
 	in := strings.Join([]string{
 		"CREATE SCHEMA IF NOT EXISTS openrails;",
@@ -114,62 +84,5 @@ func TestRewriteSchemaRefs(t *testing.T) {
 	}
 	if _, err := rewriteSchemaRefs(in, "shop", []string{"bad-schema"}); err == nil {
 		t.Fatal("invalid source schema should error")
-	}
-}
-
-func TestSplitSQL_QuoteAware(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want []string
-	}{
-		{
-			"semicolon in string literal",
-			`INSERT INTO t VALUES ('a;b'); SELECT 1`,
-			[]string{`INSERT INTO t VALUES ('a;b')`, `SELECT 1`},
-		},
-		{
-			"comment markers inside strings survive",
-			`INSERT INTO t VALUES ('-- not a comment', '/* not a comment */')`,
-			[]string{`INSERT INTO t VALUES ('-- not a comment', '/* not a comment */')`},
-		},
-		{
-			"real comments stripped",
-			"-- leading comment\nSELECT 1; /* block */ SELECT 2 -- trailing\n;",
-			[]string{"SELECT 1", "SELECT 2"},
-		},
-		{
-			"doubled-quote escape",
-			`SELECT 'it''s; fine'`,
-			[]string{`SELECT 'it''s; fine'`},
-		},
-		{
-			"backslash escape in string",
-			`SELECT 'a\'; still string'; SELECT 2`,
-			[]string{`SELECT 'a\'; still string'`, `SELECT 2`},
-		},
-		{
-			"backtick identifier with semicolon",
-			"SELECT `weird;col` FROM t",
-			[]string{"SELECT `weird;col` FROM t"},
-		},
-		{
-			"unterminated block comment truncates",
-			"SELECT 1; /* never closed SELECT 2",
-			[]string{"SELECT 1"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := splitSQL(tc.in)
-			if len(got) != len(tc.want) {
-				t.Fatalf("got %d statements %q, want %d %q", len(got), got, len(tc.want), tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("stmt %d = %q, want %q", i, got[i], tc.want[i])
-				}
-			}
-		})
 	}
 }

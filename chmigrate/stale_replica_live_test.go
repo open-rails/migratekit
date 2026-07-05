@@ -1,4 +1,4 @@
-package migratekit
+package chmigrate
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/open-rails/migratekit"
 )
 
 // TestLiveStaleReplicaRecovery reproduces the partial-wipe failure mode against
@@ -81,7 +83,7 @@ func TestLiveStaleReplicaRecovery(t *testing.T) {
 	}
 	defer pgDB.Close()
 
-	m := NewClickHouse(&ClickHouseConfig{
+	m := New(&Config{
 		ClientAddr: addr,
 		Database:   db,
 		Username:   user,
@@ -91,12 +93,12 @@ func TestLiveStaleReplicaRecovery(t *testing.T) {
 	})
 	defer m.Close()
 
-	migration := Migration{
+	migration := migratekit.Migration{
 		Name: "001_stale_replica_probe.up.sql",
 		Content: fmt.Sprintf(
 			"CREATE TABLE IF NOT EXISTS %s (id UInt64) ENGINE = ReplicatedMergeTree('%s', 'r1') ORDER BY id", target, zkPath),
 	}
-	if err := m.ApplyMigrations(ctx, []Migration{migration}); err != nil {
+	if err := m.ApplyMigrations(ctx, []migratekit.Migration{migration}); err != nil {
 		t.Fatalf("ApplyMigrations should have self-healed the stale replica, got: %v", err)
 	}
 

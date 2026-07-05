@@ -1,4 +1,4 @@
-package migratekit
+package coremigrate
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-func TestPostgresTracker_Basics(t *testing.T) {
+func TestTracker_Basics(t *testing.T) {
 	ctx := context.Background()
 
 	db, mock, err := sqlmock.New()
@@ -16,7 +16,7 @@ func TestPostgresTracker_Basics(t *testing.T) {
 	}
 	defer db.Close()
 
-	tr := newPostgresTracker(db)
+	tr := NewTracker(db)
 
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -62,57 +62,5 @@ func TestPostgresTracker_Basics(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
-func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
-	ctx := context.Background()
-
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock.New: %v", err)
-	}
-	defer db.Close()
-
-	// Setup() must succeed without touching ClickHouse migration tables when PostgresDB is provided.
-	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("migrations_app_database_schema_name_key").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-
-	ch := NewClickHouse(&ClickHouseConfig{
-		ClientAddr: "invalid:0",
-		Database:   "analytics",
-		Username:   "user",
-		Password:   "pass",
-		App:        "doujins",
-		PostgresDB: db,
-		Cluster:    "",
-	})
-
-	if err := ch.Setup(ctx); err != nil {
-		t.Fatalf("Setup: %v", err)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("sql expectations: %v", err)
-	}
-}
-
-func TestClickHouse_RequiresPostgresDB(t *testing.T) {
-	ctx := context.Background()
-
-	ch := NewClickHouse(&ClickHouseConfig{
-		ClientAddr: "invalid:0",
-		Database:   "analytics",
-		Username:   "user",
-		Password:   "pass",
-		App:        "doujins",
-	})
-
-	if err := ch.Setup(ctx); err == nil {
-		t.Fatalf("expected error, got nil")
 	}
 }

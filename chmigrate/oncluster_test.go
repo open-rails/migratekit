@@ -1,8 +1,10 @@
-package migratekit
+package chmigrate
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/open-rails/migratekit"
 )
 
 func TestOnClusterTemplateReplacement(t *testing.T) {
@@ -52,7 +54,7 @@ func TestOnClusterTemplateReplacement(t *testing.T) {
 			}
 
 			// Create a migration with the test SQL
-			migration := Migration{
+			migration := migratekit.Migration{
 				Name:    "001_test.up.sql",
 				Content: tt.sqlInput,
 			}

@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/open-rails/migratekit/internal/coremigrate"
 )
 
 const (
@@ -108,7 +110,7 @@ func rewriteSchemaRefs(sqlText, target string, from []string) (string, error) {
 
 // Setup ensures migration tables exist (idempotent)
 func (p *Postgres) Setup(ctx context.Context) error {
-	return ensurePublicMigrationsTable(ctx, p.db)
+	return coremigrate.EnsurePublicMigrationsTable(ctx, p.db)
 }
 
 // Applied returns list of applied migration names
@@ -205,7 +207,7 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration) error {
 	}
 
 	// Apply template substitution (environment variables) at execution time
-	sql, err := substituteTemplates(m.Content)
+	sql, err := coremigrate.SubstituteTemplates(m.Content)
 	if err != nil {
 		return fmt.Errorf("migration %s: %w", m.Name, err)
 	}
@@ -247,7 +249,7 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 
 	var toApply []Migration
 	for _, mig := range migrations {
-		if !contains(applied, Prefix(mig.Name)) {
+		if !coremigrate.Contains(applied, Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
 		}
 	}
@@ -272,7 +274,7 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	}
 	toApply = toApply[:0]
 	for _, mig := range migrations {
-		if !contains(applied, Prefix(mig.Name)) {
+		if !coremigrate.Contains(applied, Prefix(mig.Name)) {
 			toApply = append(toApply, mig)
 		}
 	}

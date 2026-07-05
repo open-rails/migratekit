@@ -50,6 +50,12 @@ func main() {
 
 ### ClickHouse (Complete Example)
 
+ClickHouse support lives in its own subpackage, `migratekit/chmigrate`, which
+imports `github.com/ClickHouse/clickhouse-go/v2`. The root `migratekit`
+package has zero ClickHouse imports: if you only need the Postgres migrator,
+`go mod tidy` never pulls in the ClickHouse client (Go's module graph pruning
+drops it once nothing in your module imports `migratekit/chmigrate`).
+
 ```go
 package main
 
@@ -59,6 +65,7 @@ import (
     "embed"
 
     "github.com/open-rails/migratekit"
+    "github.com/open-rails/migratekit/chmigrate"
     _ "github.com/lib/pq"
 )
 
@@ -73,7 +80,7 @@ func main() {
     migrations, _ := migratekit.LoadFromFS(clickhouseFS, "migrations/clickhouse")
 
     // Run migrations (3 lines)
-    m := migratekit.NewClickHouse(&migratekit.ClickHouseConfig{
+    m := chmigrate.New(&chmigrate.Config{
         ClientAddr: "clickhouse:9000",
         Database:   "analytics",
         Username:   "analytics_user",
@@ -96,6 +103,9 @@ err := migratekit.ValidatePostgresMigrations(ctx, db,
     migratekit.MigrationSource{App: "authkit", FS: authkitFS},
     migratekit.MigrationSource{App: "billing", FS: billingFS},
 )
+
+// ClickHouse equivalent, in the chmigrate subpackage:
+err = chmigrate.ValidateMigrations(ctx, &chmigrate.Config{App: "doujins", PostgresDB: pg}, clickhouseFS)
 ```
 
 ## Stable API (v1)
@@ -125,17 +135,21 @@ is an implementation detail and may change in any release.
 | `(*Postgres) Setup(ctx) error` | Ensures `public.migrations` exists (idempotent). `ApplyMigrations` calls it for you. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 
-### ClickHouse
+### ClickHouse (`migratekit/chmigrate`, since v1.4.0)
+
+ClickHouse is a separate subpackage so the root package never imports
+`github.com/ClickHouse/clickhouse-go/v2`. Its stable surface:
 
 | Symbol | Contract |
 |---|---|
-| `type ClickHouseConfig struct { ClientAddr, Database, Username, Password, App, Cluster string; PostgresDB *sql.DB }` | `PostgresDB` is required: tracking rows live in Postgres `public.migrations` (`database='clickhouse'`) and locking uses Postgres advisory locks. `Cluster` enables `{{ON_CLUSTER}}` expansion. |
-| `NewClickHouse(*ClickHouseConfig) *ClickHouse` | Migrator; connects to ClickHouse lazily via native protocol. |
-| `(*ClickHouse) ApplyMigrations(ctx, []Migration) error` | Same shape as Postgres. Statements run individually (no transactions) with up-to-30s retry on transient distributed-DDL errors. |
+| `type Config struct { ClientAddr, Database, Username, Password, App, Cluster string; PostgresDB *sql.DB }` | `PostgresDB` is required: tracking rows live in Postgres `public.migrations` (`database='clickhouse'`) and locking uses Postgres advisory locks. `Cluster` enables `{{ON_CLUSTER}}` expansion. |
+| `New(*Config) *ClickHouse` | Migrator; connects to ClickHouse lazily via native protocol. |
+| `(*ClickHouse) ApplyMigrations(ctx, []migratekit.Migration) error` | Same shape as Postgres. Statements run individually (no transactions) with up-to-30s retry on transient distributed-DDL errors. |
 | `(*ClickHouse) Applied(ctx) ([]string, error)` | Recorded names for this app, `database='clickhouse'`. |
 | `(*ClickHouse) Setup(ctx) error` | Ensures the Postgres tracker is ready. |
-| `(*ClickHouse) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate. |
+| `(*ClickHouse) ValidateAllApplied(ctx, []migratekit.Migration) error` | Read-only startup gate. |
 | `(*ClickHouse) Close() error` | Closes only the native ClickHouse connection the migrator itself opened (never `PostgresDB`). |
+| `ValidateMigrations(ctx, *Config, fs.FS) error` | `LoadFromFS` + `ValidateAllApplied` in one call, mirroring `ValidatePostgresMigrations` for a single ClickHouse app. |
 
 ### Multi-source startup validation
 
@@ -143,7 +157,6 @@ is an implementation detail and may change in any release.
 |---|---|
 | `type MigrationSource struct { App string; FS fs.FS }` | One app's migration filesystem. |
 | `ValidatePostgresMigrations(ctx, db, ...MigrationSource) error` | `ValidateAllApplied` across several apps in one call. `MigrationSource.Schema` and `RewriteFrom` mirror `WithSchema` for schema-aware callers. |
-| `ValidateClickHouseMigrations(ctx, *ClickHouseConfig, fs.FS) error` | Same for ClickHouse. |
 
 ### Frozen behavioral contracts
 
@@ -153,7 +166,7 @@ These behaviors are part of the API and will not change within v1.x:
 2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
-5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `ClickHouseConfig.Cluster` (empty → removed).
+5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
 6. **Postgres atomicity**: one migration = one transaction (DDL + tracking row commit together).
 7. **Postgres schema targeting**: `WithSchema(schema)` sets a per-migration transaction search path for unqualified SQL. `WithSchema(schema, "canonical")` also rewrites app-owned canonical schema references to `schema` before execution; use this for portable hard-qualified DDL, not for shared schemas like `public`.
 7. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
@@ -164,6 +177,26 @@ These behaviors are part of the API and will not change within v1.x:
 - `Postgres.Apply`, `Postgres.Lock`, `Postgres.Unlock`, `ClickHouse.Apply`, `ClickHouse.Lock`, `ClickHouse.Unlock` — the manual lock/apply path bypassed the applied-set check and made stateful locking part of the surface; `ApplyMigrations` is the supported path. (No known consumer used these.)
 - `Postgres.Close` — closed the caller's `*sql.DB`, which the migrator never owned.
 - `MigrationSource.FS` and the `ValidateClickHouseMigrations` filesystem parameter are now `fs.FS` instead of `embed.FS` (source-compatible: `embed.FS` satisfies `fs.FS`).
+
+### Changed in v1.4.0 (ClickHouse moved to its own subpackage)
+
+Everything ClickHouse-related moved from the root package into
+`migratekit/chmigrate`, to get `github.com/ClickHouse/clickhouse-go/v2` (and
+its `ch-go` dependency) out of every Postgres-only consumer's build:
+
+- `migratekit.ClickHouseConfig` → `chmigrate.Config` (same fields).
+- `migratekit.NewClickHouse` → `chmigrate.New` (same signature, returns `*chmigrate.ClickHouse`).
+- `migratekit.ClickHouse` → `chmigrate.ClickHouse` (same methods).
+- `migratekit.ValidateClickHouseMigrations` → `chmigrate.ValidateMigrations`.
+
+**Migration for existing ClickHouse consumers:** change the import to add
+`"github.com/open-rails/migratekit/chmigrate"`, and replace
+`migratekit.NewClickHouse(&migratekit.ClickHouseConfig{...})` with
+`chmigrate.New(&chmigrate.Config{...})`. `migratekit.Migration` and
+`migratekit.Prefix` are unchanged and still used for migration content.
+
+Postgres-only consumers need no code changes; running `go mod tidy` is
+enough to drop `clickhouse-go`/`ch-go` from `go.mod`/`go.sum`.
 
 ### Compatibility policy
 
@@ -194,7 +227,7 @@ Locking:
   If the process dies mid-migration, Postgres releases the lock when the
   pinned connection drops.
 - ClickHouse uses Postgres advisory locks (same pinning) and requires
-  `ClickHouseConfig.PostgresDB`.
+  `chmigrate.Config.PostgresDB`.
 
 ## Migration Files
 
@@ -247,7 +280,7 @@ Migration SQL may reference environment variables as `{{VAR_NAME}}` or
 that is **not set** is an error — silent empty-string substitution previously
 meant a typo'd `{{CLICKHOUSE_PASWORD}}` shipped an empty password into DDL. A
 variable explicitly set to the empty string is substituted as-is. `{{ON_CLUSTER}}`
-is special-cased for ClickHouse (expanded from `ClickHouseConfig.Cluster`).
+is special-cased for ClickHouse (expanded from `chmigrate.Config.Cluster`).
 Avoid `${...}`/`{{...}}` sequences in migration SQL that are not meant as
 templates.
 
