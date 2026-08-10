@@ -41,7 +41,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	}
 	// Widen the unique key from (app, database, name) to include schema.
 	// Idempotent: swap only if the old constraint is still present.
-	_, err := db.ExecContext(ctx, `
+	if _, err := db.ExecContext(ctx, `
 		DO $$
 		BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_name_key') THEN
@@ -52,6 +52,18 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 				ALTER TABLE public.migrations DROP CONSTRAINT migrations_app_database_name_key;
 			END IF;
 		END $$;
+	`); err != nil {
+		return err
+	}
+	// v1.5.0 migration identity. `name` holds only Prefix(filename) — the bare
+	// number — so the ledger cannot tell two DIFFERENT files that claimed the
+	// same number apart, and records the second as already applied. Storing the
+	// full filename and a content digest makes that detectable. Both are
+	// nullable: rows written by <=v1.4.0 have no identity to check, and a NULL
+	// is treated as "unknown", never as a mismatch.
+	_, err := db.ExecContext(ctx, `
+		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS filename TEXT;
+		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
 	`)
 	return err
 }
