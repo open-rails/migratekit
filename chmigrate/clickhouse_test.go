@@ -23,6 +23,8 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("migrations_app_database_schema_name_key").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ADD COLUMN IF NOT EXISTS filename").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	ch := New(&Config{
 		ClientAddr: "invalid:0",

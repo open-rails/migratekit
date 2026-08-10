@@ -123,6 +123,9 @@ is an implementation detail and may change in any release.
 | `type Migration struct { Name, Content string }` | One SQL migration: filename + raw file content. |
 | `LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error)` | Loads every `*.up.sql` in `dir` (default `"."`), ordered by numeric prefix. Errors on duplicate normalized prefixes. Only the first `dir` element is used. |
 | `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.name`. |
+| `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
+| `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration's bytes. |
+| `type AppliedRecord struct { Key, Filename, Digest string }` | *(v1.5.0)* One ledger row. `Filename`/`Digest` are empty for rows written by ≤v1.4.0. |
 
 ### Postgres
 
@@ -134,6 +137,8 @@ is an implementation detail and may change in any release.
 | `(*Postgres) Applied(ctx) ([]string, error)` | Recorded migration names (normalized prefixes) for this app, `database='postgres'`. |
 | `(*Postgres) Setup(ctx) error` | Ensures `public.migrations` exists (idempotent). `ApplyMigrations` calls it for you. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
+| `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
+| `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |
 
 ### ClickHouse (`migratekit/chmigrate`, since v1.4.0)
 
@@ -162,8 +167,8 @@ ClickHouse is a separate subpackage so the root package never imports
 
 These behaviors are part of the API and will not change within v1.x:
 
-1. **Tracking table**: `public.migrations (id, app, database, name, migrated_at, UNIQUE(app, database, name))` with `database` ∈ {`postgres`, `clickhouse`}. Operators may query and (carefully) repair it; its shape is stable.
-2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it.
+1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Operators may query and (carefully) repair it; its shape is stable.
+2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it. Since v1.5.0 the row also records the full filename and a content digest, so a number applied by a *different* file, or an edit to a migration that already ran, is a hard error instead of a silent skip.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
@@ -171,6 +176,36 @@ These behaviors are part of the API and will not change within v1.x:
 7. **Postgres schema targeting**: `WithSchema(schema)` sets a per-migration transaction search path for unqualified SQL. `WithSchema(schema, "canonical")` also rewrites app-owned canonical schema references to `schema` before execution; use this for portable hard-qualified DDL, not for shared schemas like `public`.
 7. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
 8. **Ownership**: migrators never close a `*sql.DB` you pass in.
+
+### Added in v1.5.0 (migration identity)
+
+The applied-migrations ledger was keyed by the migration NUMBER alone, which is
+not an identity: two different files that each claim number N normalize to the
+same key, so once one is applied the other is reported "already applied" and
+its DDL never runs — no error, clean boot, green suite. `LoadFromFS` rejects two
+colliding files in one tree, but the damaging case never has both in one tree:
+lane A's N is applied to a live database, lane B renumbers or reverts, and B's N
+is skipped forever.
+
+v1.5.0 records `filename` and `content_sha256` next to the key and checks them
+on every apply:
+
+- **Identity** — number N applied by a different file is a hard error naming
+  both files and demanding a renumber.
+- **Integrity** — a migration edited after it ran is a hard error.
+
+Both are always on and cannot fire spuriously: rows written by ≤v1.4.0 carry no
+identity, and unknown reads as unknown, never as a mismatch. The two new columns
+are added by `Setup()`; no consumer action is required.
+
+- **Ordering** — `WithStrictOrdering()` additionally refuses a pending migration
+  that sorts below one already applied. Opt-in, because existing chains
+  legitimately carry gaps and late arrivals that predate the rule.
+- `CheckChain(names)` validates a chain as a plain file listing (duplicates,
+  gaps, monotonicity) with no database, for a CI gate on the merge boundary.
+
+Execution is unchanged: appliers are serialized by the advisory lock and
+migrations run one at a time, in order.
 
 ### Removed in v1.0 (was public in v0.x)
 

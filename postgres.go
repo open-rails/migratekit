@@ -45,6 +45,10 @@ type Postgres struct {
 	// another, leaking the real lock until the first connection is recycled.
 	lockMu   sync.Mutex
 	lockConn *sql.Conn
+
+	// strictOrdering refuses to apply a migration that sorts below one
+	// already applied. See WithStrictOrdering.
+	strictOrdering bool
 }
 
 // NewPostgres creates a Postgres migrator
@@ -219,10 +223,14 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration) error {
 		return err
 	}
 
+	// `name` stays Prefix(m.Name) — it is the ledger key every existing
+	// database is written with. filename/content_sha256 carry the identity
+	// that key cannot express (see verifyIdentity).
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name) VALUES ($1, $2, $3, $4)
+		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (app, database, schema, name) DO NOTHING`,
-		p.app, postgresDriver, p.schema, Prefix(m.Name)); err != nil {
+		p.app, postgresDriver, p.schema, Prefix(m.Name), m.Name, ContentDigest(m.Content)); err != nil {
 		return err
 	}
 
@@ -242,14 +250,19 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 		}
 	}
 
-	applied, err := p.Applied(ctx)
+	// Identity is checked BEFORE the lock so a corrupt chain fails fast, and
+	// again under it so a racing process cannot slip a claim in between.
+	records, err := p.AppliedRecords(ctx)
 	if err != nil {
+		return err
+	}
+	if err := verifyIdentity(migrations, records, p.strictOrdering); err != nil {
 		return err
 	}
 
 	var toApply []Migration
 	for _, mig := range migrations {
-		if !coremigrate.Contains(applied, Prefix(mig.Name)) {
+		if _, ok := records[Prefix(mig.Name)]; !ok {
 			toApply = append(toApply, mig)
 		}
 	}
@@ -268,13 +281,16 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	}()
 
 	// Double-check under lock in case another process applied some since our first read
-	applied, err = p.Applied(ctx)
+	records, err = p.AppliedRecords(ctx)
 	if err != nil {
+		return err
+	}
+	if err := verifyIdentity(migrations, records, p.strictOrdering); err != nil {
 		return err
 	}
 	toApply = toApply[:0]
 	for _, mig := range migrations {
-		if !coremigrate.Contains(applied, Prefix(mig.Name)) {
+		if _, ok := records[Prefix(mig.Name)]; !ok {
 			toApply = append(toApply, mig)
 		}
 	}
