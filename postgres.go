@@ -128,7 +128,12 @@ func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
 	// never a wildcard: a WithSchema group must not accept schema-less rows as
 	// proof of application (that silently skips migrations for the new schema).
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT name FROM public.migrations WHERE app = $1 AND database = $2 AND schema = $3 ORDER BY name`,
+		// COALESCE(status,'applied'): a row that is still running, or that
+		// failed half-applied, is NOT proof of application — see notx.go.
+		`SELECT name FROM public.migrations
+		  WHERE app = $1 AND database = $2 AND schema = $3
+		    AND COALESCE(status, 'applied') = 'applied'
+		  ORDER BY name`,
 		p.app, postgresDriver, p.schema)
 	if err != nil {
 		return nil, err
@@ -201,6 +206,9 @@ func (p *Postgres) unlock(ctx context.Context) error {
 // ordering-exception audit row in the same transaction as the DDL, so the
 // deviation and the schema change are one atomic fact.
 func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairRequest) error {
+	if hasNoTransactionDirective(m.Content) {
+		return p.applyOneNoTx(ctx, m, audit)
+	}
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

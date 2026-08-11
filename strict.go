@@ -64,11 +64,20 @@ type AppliedRecord struct {
 	// Digest is the sha256 of the applied migration's content. Empty for
 	// rows written before v1.5.0.
 	Digest string
+	// Status is the apply state: applied, running or failed. Empty for rows
+	// written before v1.7.0, which are applied by construction — only a
+	// no-transaction migration can be anything else.
+	Status string
+	// Error is the recorded cause of a failed no-transaction apply.
+	Error string
 }
 
-// ContentDigest is the ledger's digest of a migration's bytes.
+// ContentDigest is the ledger's digest of a migration's CANONICAL BODY — the
+// file with its own `-- parent:` header removed (see chain.go). A headerless
+// file hashes to exactly what v1.5.0 recorded, so adding a parent line to an
+// already-applied migration changes no ledger digest.
 func ContentDigest(content string) string {
-	sum := sha256.Sum256([]byte(content))
+	sum := sha256.Sum256([]byte(canonicalBody(content)))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -123,7 +132,8 @@ func defaultWarn(d Discrepancy) {
 // AppliedRecords returns the applied-migrations ledger keyed by ledger key.
 func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord, error) {
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT name, COALESCE(filename, ''), COALESCE(content_sha256, '')
+		`SELECT name, COALESCE(filename, ''), COALESCE(content_sha256, ''),
+		        COALESCE(status, ''), COALESCE("error", '')
 		   FROM public.migrations
 		  WHERE app = $1 AND database = $2 AND schema = $3`,
 		p.app, postgresDriver, p.schema)
@@ -135,7 +145,7 @@ func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord
 	out := map[string]AppliedRecord{}
 	for rows.Next() {
 		var rec AppliedRecord
-		if err := rows.Scan(&rec.Key, &rec.Filename, &rec.Digest); err != nil {
+		if err := rows.Scan(&rec.Key, &rec.Filename, &rec.Digest, &rec.Status, &rec.Error); err != nil {
 			return nil, err
 		}
 		out[rec.Key] = rec
@@ -164,6 +174,23 @@ func analyze(migrations []Migration, applied map[string]AppliedRecord, opts chec
 	for _, m := range migrations {
 		rec, ok := applied[Prefix(m.Name)]
 		if !ok {
+			continue
+		}
+		// An unfinished no-transaction apply. Nothing else about this row can
+		// be trusted until an operator says what happened, so it is reported
+		// alone and it blocks.
+		if rec.isDirty() {
+			out = append(out, Discrepancy{
+				Kind:           KindDirtyMigration,
+				Severity:       SeverityError,
+				Key:            rec.Key,
+				File:           m.Name,
+				LedgerFilename: rec.Filename,
+				LedgerDigest:   rec.Digest,
+				FileDigest:     ContentDigest(m.Content),
+				LedgerStatus:   rec.Status,
+				LedgerError:    rec.Error,
+			})
 			continue
 		}
 		// A number applied by a DIFFERENT file: this migration would be

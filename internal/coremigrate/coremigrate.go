@@ -67,6 +67,18 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	`); err != nil {
 		return err
 	}
+	// v1.7.0 no-transaction migrations. A migration that runs outside a
+	// transaction can fail HALF-APPLIED, so the ledger has to be able to hold
+	// an unfinished state instead of only "row present = done". DEFAULT
+	// 'applied' means every existing row, and every transactional insert, is
+	// complete by construction — nothing to backfill, and the transactional
+	// path stays one atomic insert.
+	if _, err := db.ExecContext(ctx, `
+		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'applied';
+		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS "error" TEXT;
+	`); err != nil {
+		return err
+	}
 	// v1.6.0 repair audit. Operators can rewrite the identity columns above
 	// with `migratekit repair`, which is the point — the checks are worth
 	// nothing if the only way past them is a hand-written UPDATE. What makes
