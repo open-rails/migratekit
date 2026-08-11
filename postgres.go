@@ -49,6 +49,11 @@ type Postgres struct {
 	// strictOrdering refuses to apply a migration that sorts below one
 	// already applied. See WithStrictOrdering.
 	strictOrdering bool
+	// strictContent turns content drift from a warning into an error. See
+	// WithStrictContent.
+	strictContent bool
+	// warn is the sink for warning-severity discrepancies. See WithWarnFunc.
+	warn func(Discrepancy)
 }
 
 // NewPostgres creates a Postgres migrator
@@ -192,8 +197,10 @@ func (p *Postgres) unlock(ctx context.Context) error {
 
 // applyOne applies a single migration without checking the applied set or
 // taking the lock; callers must hold the lock and filter applied
-// migrations first (see ApplyMigrations).
-func (p *Postgres) applyOne(ctx context.Context, m Migration) error {
+// migrations first (see ApplyMigrations). A non-nil audit records an
+// ordering-exception audit row in the same transaction as the DDL, so the
+// deviation and the schema change are one atomic fact.
+func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairRequest) error {
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -234,12 +241,25 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration) error {
 		return err
 	}
 
+	if audit != nil {
+		if err := p.insertAudit(ctx, tx, "apply --allow-below-applied", Prefix(m.Name),
+			"", "", m.Name, ContentDigest(m.Content), *audit); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit()
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed).
 // Setup() always runs first, so there is no missing-table special case.
-func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) (err error) {
+func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) error {
+	return p.applyMigrations(ctx, migrations, nil, nil)
+}
+
+// applyMigrations is the shared apply path. allowBelow exempts ledger keys
+// from the ordering rule and audit, when non-nil, records the exception.
+func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, allowBelow map[string]bool, audit *RepairRequest) (err error) {
 	// CREATE TABLE IF NOT EXISTS is cheap and almost always a no-op. Two
 	// replicas racing the very first Setup can hit Postgres's known
 	// concurrent-create race (duplicate key on pg_type/pg_class); one retry
@@ -250,13 +270,21 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 		}
 	}
 
+	opts := checkOptions{
+		strictOrdering: p.strictOrdering,
+		strictContent:  p.strictContent,
+		allowBelow:     allowBelow,
+	}
+
 	// Identity is checked BEFORE the lock so a corrupt chain fails fast, and
 	// again under it so a racing process cannot slip a claim in between.
 	records, err := p.AppliedRecords(ctx)
 	if err != nil {
 		return err
 	}
-	if err := verifyIdentity(migrations, records, p.strictOrdering); err != nil {
+	discrepancies := analyze(migrations, records, opts)
+	p.emit(discrepancies) // warnings once, on the pass that always runs
+	if err := firstError(discrepancies); err != nil {
 		return err
 	}
 
@@ -285,7 +313,7 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	if err != nil {
 		return err
 	}
-	if err := verifyIdentity(migrations, records, p.strictOrdering); err != nil {
+	if err := firstError(analyze(migrations, records, opts)); err != nil {
 		return err
 	}
 	toApply = toApply[:0]
@@ -310,7 +338,11 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 	}
 
 	for _, mig := range toApply {
-		if err := p.applyOne(ctx, mig); err != nil {
+		var rowAudit *RepairRequest
+		if audit != nil && allowBelow[Prefix(mig.Name)] {
+			rowAudit = audit
+		}
+		if err := p.applyOne(ctx, mig, rowAudit); err != nil {
 			return err
 		}
 	}

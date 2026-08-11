@@ -67,6 +67,12 @@ func TestStrict_NumberReusedByDifferentFile(t *testing.T) {
 // TestStrict_AppliedMigrationEdited catches an edit to a migration that has
 // already run. v1.4.0 cannot see it: the number is applied, so the file is
 // skipped and this database silently diverges from a fresh one.
+//
+// v1.6.0 (Paul, 2026-08-11) reports it as a WARNING rather than refusing the
+// boot: the operator who made the edit may have no way back to the old bytes,
+// and a database held down over a comment change is a worse outcome than the
+// divergence risk. WithStrictContent keeps the v1.5.0 refusal for consumers
+// that want it. Either way the drift is never silent.
 func TestStrict_AppliedMigrationEdited(t *testing.T) {
 	const app = "mk_strict_edit"
 	db, ctx := strictTestDB(t, app)
@@ -77,9 +83,23 @@ func TestStrict_AppliedMigrationEdited(t *testing.T) {
 	}
 
 	edited := []Migration{{Name: "0001_init.up.sql", Content: `CREATE TABLE mk_strict_edit_a (id int, extra text)`}}
-	err := NewPostgres(db, app).ApplyMigrations(ctx, edited)
+
+	var warnings []Discrepancy
+	if err := NewPostgres(db, app).
+		WithWarnFunc(func(d Discrepancy) { warnings = append(warnings, d) }).
+		ApplyMigrations(ctx, edited); err != nil {
+		t.Fatalf("the default must boot: %v", err)
+	}
+	if len(warnings) != 1 || warnings[0].Severity != SeverityWarning {
+		t.Fatalf("the edit must be reported as a warning, got %+v", warnings)
+	}
+	if !strings.Contains(warnings[0].String(), "EDITED") {
+		t.Errorf("warning should say the migration was edited; got: %v", warnings[0])
+	}
+
+	err := NewPostgres(db, app).WithStrictContent().ApplyMigrations(ctx, edited)
 	if err == nil {
-		t.Fatal("edit to an applied migration was accepted; this database now differs from a fresh one with no signal")
+		t.Fatal("WithStrictContent must refuse an edit to an applied migration")
 	}
 	if !strings.Contains(err.Error(), "EDITED") {
 		t.Errorf("error should say the migration was edited; got: %v", err)

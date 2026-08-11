@@ -108,6 +108,60 @@ err := migratekit.ValidatePostgresMigrations(ctx, db,
 err = chmigrate.ValidateMigrations(ctx, &chmigrate.Config{App: "doujins", PostgresDB: pg}, clickhouseFS)
 ```
 
+## When boot refuses: operator runbook
+
+The identity checks stop a migration from silently never running. That is worth a boot
+refusal — but only if there is a way out of it that is not `psql` and a hand-written
+`UPDATE public.migrations`. Since v1.6.0 there is:
+
+```bash
+go run github.com/open-rails/migratekit/cmd/migratekit@latest status \
+  -app tensorhub -dir migrations/postgres -dsn "$DATABASE_URL"
+```
+
+`status` prints, for every discrepancy, WHAT is wrong (file, number, both digests), the
+LIKELY CAUSES, and the command that resolves each one. Every boot refusal ends by
+pointing at it.
+
+| What you see | What it means | Resolution |
+|---|---|---|
+| `number "N" was already applied by a DIFFERENT file` **(error)** | Two lanes claimed N; the other one merged first. Your file would be recorded as already applied and its DDL would never run. | Renumber your file to the next free number. Nothing in the database changes. |
+| `migration X was EDITED after it was applied` **(warning — boot proceeds)** | X's bytes changed since it ran here. This database has the old schema, a fresh one gets the new. | Cosmetic edit: `repair accept-content N --reason "…"`. Otherwise revert the file and add a new migration. |
+| `migration X sorts BEFORE Y, which is already applied` **(error, `WithStrictOrdering` only)** | A lane branched below the high-water mark and merged late. | Renumber X above Y. Genuine backport: `apply --allow-below-applied N --reason "…"`, which applies it once and records the deviation. |
+| Row 1's error, but **your files are right and the ledger is the wrong side** | A restored backup, an adopted database, or a hand-fixed row: the ledger remembers a tree that no longer exists. | `repair adopt N --reason "…"` — or `repair adopt --all-unmatched --reason "…"` when every row mismatches, which is what a restore actually looks like. |
+
+Rows 1 and 4 are the same error with opposite fixes, which is why `status` prints both
+causes and you pick. The question to ask is *which side is stale, the files or the
+ledger?* Renumber when a colliding file really exists; adopt when it does not.
+
+### The repair verbs
+
+```bash
+migratekit repair adopt 42 --reason "restored the 2026-08-10 backup"
+migratekit repair adopt --all-unmatched --reason "adopted the doujins cluster"
+migratekit repair accept-content 7 --reason "comment typo; DDL byte-identical"
+migratekit apply --allow-below-applied 91 --reason "backport of the th#1712 index"
+migratekit history          # everything anyone has ever repaired here
+```
+
+Every one of them:
+
+- **requires `--reason`**, recorded verbatim — a ledger repair with no recorded reason is
+  indistinguishable from tampering;
+- **writes an audit row** to `public.migration_repairs` (verb, reason, `--operator`, the OS
+  user, the host, and the old and new identity) **in the same transaction** as the change.
+  A repaired ledger is visible history, not an erased one;
+- **touches the ledger's identity columns only** — never schema, never DDL, and never marks
+  an unapplied migration applied;
+- **supports `--dry-run`**, which prints the exact before/after and writes nothing;
+- **refuses to run in CI.** A repair rewrites one database's ledger after a human has read
+  the diff. If every database trips over the same thing, the chain is wrong and the fix
+  belongs in the repository.
+
+The same verbs are available to Go callers as `(*Postgres).RepairAdopt`,
+`RepairAdoptAllUnmatched`, `RepairAcceptContent`, `ApplyWithOrderingException` and
+`RepairHistory`, all taking a `RepairRequest{Reason, Operator, DryRun}`.
+
 ## Stable API (v1)
 
 Everything in this section is the v1 compatibility boundary. Within v1.x it
@@ -139,6 +193,17 @@ is an implementation detail and may change in any release.
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |
+| `(*Postgres) WithStrictContent() *Postgres` | *(v1.6.0)* Turn content drift back into a hard error. Default is a warning. |
+| `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | *(v1.6.0)* Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
+| `(*Postgres) Status(ctx, []Migration) (Status, error)` | *(v1.6.0)* Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Read-only apart from `Setup`. |
+| `(*Postgres) RepairAdopt(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Bind the file in the tree as the applied identity for its number. For a ledger that is the stale side. |
+| `(*Postgres) RepairAdoptAllUnmatched(ctx, []Migration, RepairRequest) ([]RepairResult, error)` | *(v1.6.0)* The same for every mismatched row at once — the restored-backup shape. |
+| `(*Postgres) RepairAcceptContent(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Re-stamp the digest after a verified edit; clears the drift warning. Refuses on an identity mismatch. |
+| `(*Postgres) ApplyWithOrderingException(ctx, []Migration, allowBelow []string, RepairRequest) error` | *(v1.6.0)* Apply with a one-shot exemption from the ordering rule. Identity checks are not relaxed. |
+| `(*Postgres) RepairHistory(ctx) ([]RepairRecord, error)` | *(v1.6.0)* The audit trail, newest first. |
+| `type RepairRequest struct { Reason, Operator string; DryRun bool }` | *(v1.6.0)* `Reason` is required. Every repair refuses under CI (`DetectCI`). |
+| `type Status`, `type Discrepancy`, `type RepairResult`, `type RepairRecord`, `Severity`, `DiscrepancyKind` | *(v1.6.0)* Reporting types. `Discrepancy.String()` is the full explanation; `OneLine()` is the log-line form. |
+| `DetectCI() (string, bool)` | *(v1.6.0)* Names the CI environment variable that is set, if any. |
 
 ### ClickHouse (`migratekit/chmigrate`, since v1.4.0)
 
@@ -167,8 +232,8 @@ ClickHouse is a separate subpackage so the root package never imports
 
 These behaviors are part of the API and will not change within v1.x:
 
-1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Operators may query and (carefully) repair it; its shape is stable.
-2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it. Since v1.5.0 the row also records the full filename and a content digest, so a number applied by a *different* file, or an edit to a migration that already ran, is a hard error instead of a silent skip.
+1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Its shape is stable. Since v1.6.0 `public.migration_repairs` records every repair; prefer `migratekit repair` over editing either table by hand, because only the verbs write the audit row.
+2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it. Since v1.5.0 the row also records the full filename and a content digest: a number applied by a *different* file is a hard error instead of a silent skip, and an edit to a migration that already ran is reported (a warning since v1.6.0, an error under `WithStrictContent`).
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
@@ -207,6 +272,26 @@ are added by `Setup()`; no consumer action is required.
 Execution is unchanged: appliers are serialized by the advisory lock and
 migrations run one at a time, in order.
 
+### Changed in v1.6.0 (the resolution path)
+
+v1.5.0 made three failures visible. It did not make any of them *resolvable*: the boot
+refused, named the problem, and left the operator with `psql`. v1.6.0 is the other half —
+`status`, four audited repair verbs, and one relaxation.
+
+**Content drift is now a WARNING, not a boot error.** An operator who edited a migration
+that already ran often cannot restore the old bytes, and a database held down over a
+comment change is a worse outcome than the divergence the check guards against. The boot
+proceeds and emits a warning naming the file, both digests, the risk, and
+`repair accept-content`. `WithStrictContent()` restores the v1.5.0 refusal.
+
+The other two are unchanged. A number applied by a different file is still a hard error —
+it is the silent-never-runs killer, and its fix (renumber, or adopt) is always available.
+`WithStrictOrdering()` behaves exactly as before.
+
+Everything else is additive: `Status`, `WithWarnFunc`, the repair verbs, the
+`public.migration_repairs` audit table (created by `Setup`), and the `cmd/migratekit` CLI.
+No consumer action is required, and no call site changes.
+
 ### Removed in v1.0 (was public in v0.x)
 
 - `Postgres.Apply`, `Postgres.Lock`, `Postgres.Unlock`, `ClickHouse.Apply`, `ClickHouse.Lock`, `ClickHouse.Unlock` — the manual lock/apply path bypassed the applied-set check and made stateful locking part of the surface; `ApplyMigrations` is the supported path. (No known consumer used these.)
@@ -241,16 +326,38 @@ enough to drop `clickhouse-go`/`ch-go` from `go.mod`/`go.sum`.
 
 ## Schema
 
-migratekit creates one table in `public` schema on first `Setup()`:
+migratekit creates two tables in the `public` schema on first `Setup()`:
 
 ```sql
 CREATE TABLE public.migrations (
     id BIGSERIAL PRIMARY KEY,
     app TEXT NOT NULL,
     database TEXT NOT NULL,
-    name TEXT NOT NULL,
+    schema TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,             -- the ledger KEY: Prefix(filename)
+    filename TEXT,                  -- v1.5.0 identity; NULL on older rows
+    content_sha256 TEXT,            -- v1.5.0 integrity; NULL on older rows
     migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(app, database, name)
+    UNIQUE(app, database, schema, name)
+);
+
+-- v1.6.0: every `migratekit repair` lands here, in the same transaction as the
+-- identity change it made. The checks are only worth having if there is a way
+-- past them; this is what keeps that way honest.
+CREATE TABLE public.migration_repairs (
+    id BIGSERIAL PRIMARY KEY,
+    app TEXT NOT NULL,
+    database TEXT NOT NULL,
+    schema TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,             -- the ledger key repaired
+    verb TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    operator TEXT NOT NULL DEFAULT '',
+    os_user TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    old_filename TEXT, old_digest TEXT,
+    new_filename TEXT, new_digest TEXT,
+    repaired_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
 
@@ -334,6 +441,7 @@ of string literals and comments, so semicolons inside quoted strings are safe.
 - **App-scoped**: Each app has independent migration sequences
 - **Correct Postgres locking**: Uses Postgres advisory locks (no lock table)
 - **ClickHouse compatibility**: Runs ClickHouse DDL via native protocol; tracks applied migrations in Postgres
+- **Resolvable**: every refusal has a `migratekit status` explanation and an audited repair verb
 - **Self-contained**: Creates own tables on first run
 - **Minimal**: small codebase + minimal dependencies
 
