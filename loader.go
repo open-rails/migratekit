@@ -8,17 +8,28 @@ import (
 	"strings"
 )
 
-// LoadFromFS loads migrations from an embedded filesystem.
-// Reads all .up.sql files, ordered by numeric prefix (so unpadded names like
-// 2_x and 10_x apply in numeric order), falling back to filename order for
-// non-numeric names. Returns an error if two files normalize to the same
-// Prefix() — tracking is prefix-keyed, so a duplicate prefix would silently
-// skip the second file as "already applied".
+// LoadFromFS loads migrations from an embedded filesystem and verifies the
+// parent-link chain with default options (headerless migrations tolerated with
+// a warning). It is Load(fsys, dir) — use Load directly for
+// RequireParentLinks or a custom warning sink.
 // If dir is empty, defaults to "." (root of the filesystem).
 func LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error) {
 	directory := "."
 	if len(dir) > 0 && dir[0] != "" {
 		directory = dir[0]
+	}
+	return Load(fsys, directory)
+}
+
+// loadFiles reads all .up.sql files, ordered by numeric prefix (so unpadded
+// names like 2_x and 10_x apply in numeric order), falling back to filename
+// order for non-numeric names. Returns an error if two files normalize to the
+// same Prefix() — tracking is prefix-keyed, so a duplicate prefix would
+// silently skip the second file as "already applied". It does NOT verify the
+// parent-link chain; that is Load's job.
+func loadFiles(fsys fs.FS, directory string) ([]Migration, error) {
+	if directory == "" {
+		directory = "."
 	}
 	entries, err := fs.ReadDir(fsys, directory)
 	if err != nil {
