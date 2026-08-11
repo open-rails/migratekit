@@ -222,7 +222,7 @@ func TestChain_HeaderlessIsWarnedNotRefused(t *testing.T) {
 	var warned []string
 	_, err := Load(chainFS(map[string]string{
 		"0001_a.up.sql": "SELECT 1;\n", "0002_b.up.sql": "SELECT 2;\n",
-	}), ".", WithWarnFunc(func(s string) { warned = append(warned, s) }))
+	}), ".", WithChainWarnFunc(func(s string) { warned = append(warned, s) }))
 	if err != nil {
 		t.Fatalf("headerless files must be tolerated: %v", err)
 	}

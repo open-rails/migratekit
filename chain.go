@@ -136,9 +136,9 @@ type loadConfig struct {
 // booting; adopt it once your chain carries headers.
 func RequireParentLinks() LoadOption { return func(c *loadConfig) { c.require = true } }
 
-// WithWarnFunc redirects legacy-tolerance warnings. Defaults to the standard
+// WithChainWarnFunc redirects legacy-tolerance warnings. Defaults to the standard
 // logger.
-func WithWarnFunc(fn func(string)) LoadOption {
+func WithChainWarnFunc(fn func(string)) LoadOption {
 	return func(c *loadConfig) {
 		if fn != nil {
 			c.warn = fn

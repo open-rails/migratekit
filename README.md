@@ -128,6 +128,7 @@ pointing at it.
 | `number "N" was already applied by a DIFFERENT file` **(error)** | Two lanes claimed N; the other one merged first. Your file would be recorded as already applied and its DDL would never run. | Renumber your file to the next free number. Nothing in the database changes. |
 | `migration X was EDITED after it was applied` **(warning — boot proceeds)** | X's bytes changed since it ran here. This database has the old schema, a fresh one gets the new. | Cosmetic edit: `repair accept-content N --reason "…"`. Otherwise revert the file and add a new migration. |
 | `migration X sorts BEFORE Y, which is already applied` **(error, `WithStrictOrdering` only)** | A lane branched below the high-water mark and merged late. | Renumber X above Y. Genuine backport: `apply --allow-below-applied N --reason "…"`, which applies it once and records the deviation. |
+| `migration X is failed, not applied` **(error)** | A `-- migratekit:no-transaction` migration failed or was interrupted, so it may be HALF applied. The ledger holds the state rather than guessing. | Undo the partial work (a failed `CREATE INDEX CONCURRENTLY` leaves an INVALID index — `DROP INDEX` it), then `repair resolve N --rerun --reason "…"`. If the DDL actually landed, `repair resolve N --applied --reason "…"`. |
 | Row 1's error, but **your files are right and the ledger is the wrong side** | A restored backup, an adopted database, or a hand-fixed row: the ledger remembers a tree that no longer exists. | `repair adopt N --reason "…"` — or `repair adopt --all-unmatched --reason "…"` when every row mismatches, which is what a restore actually looks like. |
 
 Rows 1 and 4 are the same error with opposite fixes, which is why `status` prints both
@@ -178,8 +179,13 @@ is an implementation detail and may change in any release.
 | `LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error)` | Loads every `*.up.sql` in `dir` (default `"."`), ordered by numeric prefix. Errors on duplicate normalized prefixes. Only the first `dir` element is used. |
 | `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.name`. |
 | `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
-| `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration's bytes. |
-| `type AppliedRecord struct { Key, Filename, Digest string }` | *(v1.5.0)* One ledger row. `Filename`/`Digest` are empty for rows written by ≤v1.4.0. |
+| `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration. **Since v1.7.0 it hashes the CANONICAL BODY** — the file with its own `-- parent:` header removed — so adding a parent line to an applied migration changes no ledger digest. A headerless file hashes exactly as it did in v1.5.0. |
+| `type AppliedRecord struct { Key, Filename, Digest, Status, Error string }` | One ledger row. `Filename`/`Digest` are empty for rows written by ≤v1.4.0; `Status`/`Error` (v1.7.0) are empty for rows written by ≤v1.6.0, which are applied by construction. |
+| `Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error)` | *(v1.7.0)* `LoadFromFS` plus options. `RequireParentLinks()` makes a headerless migration an error; `WithChainWarnFunc(fn)` redirects the tolerance warnings. |
+| `VerifyChain(migrations []Migration, opts ...LoadOption) error` | *(v1.7.0)* The parent-link check on an already-loaded chain. |
+| `CheckChainFS(fsys fs.FS, dir string, requireLinks bool) error` | *(v1.7.0)* The CI gate: `CheckChain`'s numbering rules plus parent-link validation, which needs the bytes and not just the names. |
+| `CheckRepairTotality(fsys fs.FS, dir string) error` | *(v1.7.0)* Refuses a constraint over pre-existing data that carries no repair. Pure file analysis. |
+| `Relink(dir string, RelinkOptions) ([]RelinkChange, error)` | *(v1.7.0)* Rewrites parent lines to match the current order. Files only — no database, no audit, CI-safe. |
 
 ### Postgres
 
@@ -232,12 +238,12 @@ ClickHouse is a separate subpackage so the root package never imports
 
 These behaviors are part of the API and will not change within v1.x:
 
-1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Its shape is stable. Since v1.6.0 `public.migration_repairs` records every repair; prefer `migratekit repair` over editing either table by hand, because only the verbs write the audit row.
+1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, status, error, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Its shape is stable. Since v1.6.0 `public.migration_repairs` records every repair; prefer `migratekit repair` over editing either table by hand, because only the verbs write the audit row.
 2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it. Since v1.5.0 the row also records the full filename and a content digest: a number applied by a *different* file is a hard error instead of a silent skip, and an edit to a migration that already ran is reported (a warning since v1.6.0, an error under `WithStrictContent`).
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
-6. **Postgres atomicity**: one migration = one transaction (DDL + tracking row commit together).
+6. **Postgres atomicity**: one migration = one transaction — the DDL and its ledger row commit together, so a failed migration applies nothing and records nothing. **The one exception is explicit**: a migration whose leading comment block carries `-- migratekit:no-transaction` runs outside a transaction and can fail half-applied; the ledger then records it `failed` (or `running` after a crash) and boot refuses until an operator resolves it.
 7. **Postgres schema targeting**: `WithSchema(schema)` sets a per-migration transaction search path for unqualified SQL. `WithSchema(schema, "canonical")` also rewrites app-owned canonical schema references to `schema` before execution; use this for portable hard-qualified DDL, not for shared schemas like `public`.
 7. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
 8. **Ownership**: migrators never close a `*sql.DB` you pass in.
@@ -292,6 +298,94 @@ Everything else is additive: `Status`, `WithWarnFunc`, the repair verbs, the
 `public.migration_repairs` audit table (created by `Setup`), and the `cmd/migratekit` CLI.
 No consumer action is required, and no call site changes.
 
+### Added in v1.7.0 (parent links, no-transaction, repair totality)
+
+**Parent-hash links.** Every migration carries its parent as its first non-blank line:
+
+```sql
+-- parent: 5 sha256:9f2c…e1
+```
+
+and the first migration of the chain carries `-- parent: root`. The chain is verified at
+LOAD — pure file reading, no database — so boot and CI both inherit it, and there is no
+second verification point to keep in sync.
+
+Two things follow. An ordering conflict becomes structurally impossible: the lane that
+merges second has a parent line pointing at a file that is no longer its predecessor,
+which is a deterministic refusal in its own PR rather than a boot refusal in production.
+And the directory becomes a hash chain: tampering with history breaks every later link,
+which is `atlas.sum`'s property with no sum file to maintain.
+
+Refused, each naming both files: a missing parent, a hash mismatch, two files claiming the
+same parent, two roots, a root that is not the lowest-numbered file, a link that points
+forward, and a link that skips the immediate predecessor (the stale-after-renumber shape).
+
+**The digest excludes the parent line.** `ContentDigest` hashes the canonical body — the
+file with its own header removed — and that is also what `content_sha256` stores. Adding
+parent lines to already-applied migrations therefore changes no ledger digest: adoption is
+silent, every digest v1.5.0 wrote is still correct, and there is nothing to backfill.
+
+**Renumbering** is now `git mv` PLUS updating your parent line. The error message says so,
+and `migratekit relink` does it in one command:
+
+```bash
+migratekit relink -dir migrations/postgres            # fix the parent lines
+migratekit relink -dir migrations/postgres --check    # CI: exit 1 if any are stale
+```
+
+`relink` is an AUTHORING verb and deliberately does NOT carry the repair verbs' guardrails
+— no `--reason`, no audit row, no CI refusal. The repair verbs mutate a production ledger:
+state that is invisible, shared, and has no history of its own. `relink` mutates files,
+and files already have an audit log — git. A `--reason` would duplicate the commit
+message, an audit table cannot record a change that may never be committed, and refusing
+to run in CI would be wrong because `relink --check` *is* the CI gate.
+
+**A squash resets the chain root**, with no special case in the code: a squash deletes the
+files it replaces, so the squash file is the lowest-numbered file present and legitimately
+carries `-- parent: root`. One rule — exactly one root, and it must be the lowest-numbered
+file — covers squashes and ordinary chains alike.
+
+**Adoption.** Headerless migrations are tolerated with a warning for one minor version.
+Mixed chains work: a headed file verifies against a headerless parent (hashing a parent
+does not require the parent to have a header), so a repo adopts by heading its newest file
+and letting the rest follow. `Load(fsys, dir, RequireParentLinks())` makes a missing header
+an error. The default flips no earlier than v1.8.0.
+
+**`-- migratekit:no-transaction`.** Migrations are transactional by default and the ledger
+row commits with the DDL. `CREATE INDEX CONCURRENTLY` — the only index build that does not
+take an `ACCESS EXCLUSIVE` lock on a live table — cannot live inside that, so a migration
+whose leading comment block carries the directive runs outside a transaction, one
+statement at a time, still under the advisory lock.
+
+Such a migration may be PARTIALLY applied, and no design makes it atomic. So the ledger
+holds the state instead of hiding it: `running` before it executes, `applied` on success,
+`failed` with the Postgres error text on failure, and still `running` if the process dies.
+**Boot refuses on any row that is not `applied`** — not absent, which would silently re-run
+half-applied DDL, and not applied, which would silently skip the other half. The operator
+clears it with the audited `migratekit repair resolve N --applied|--rerun --reason "…"`.
+
+**Repair totality.** A constraint added over a table that already has rows is a bet that
+the rows comply, and when the bet loses it fails on a live database mid-boot. So:
+
+> A constraint over a PRE-EXISTING table must be preceded, in the same file, by either the
+> repair DML that makes the data satisfy it, or `-- Repair: none-needed <reason>`.
+
+Position is the rule, not a detail: a repair below the constraint runs after the
+constraint has already refused the rows. A table `CREATE TABLE`d in the same file is
+exempt — no pre-existing row can exist. Detection is a conservative lexical scan of the
+closed set of DDL that can refuse stored rows (`ADD CONSTRAINT … CHECK` / `FOREIGN KEY` /
+`UNIQUE`, `VALIDATE CONSTRAINT`, `CREATE UNIQUE INDEX`, `SET NOT NULL`, `ALTER COLUMN …
+TYPE`, `ADD COLUMN … NOT NULL` with no default); when it cannot resolve which table a
+statement targets it reports UNKNOWN and requires the waiver rather than guessing.
+
+Measuring the real data is how you *choose* the repair — delete versus backfill is a
+semantic call you cannot make without looking at the rows — but nothing requires or parses
+a measurement. `CheckRepairTotality` enforces the repair.
+
+```bash
+migratekit check -dir migrations/postgres --require-links   # numbering + links + repair rule
+```
+
 ### Removed in v1.0 (was public in v0.x)
 
 - `Postgres.Apply`, `Postgres.Lock`, `Postgres.Unlock`, `ClickHouse.Apply`, `ClickHouse.Lock`, `ClickHouse.Unlock` — the manual lock/apply path bypassed the applied-set check and made stateful locking part of the surface; `ApplyMigrations` is the supported path. (No known consumer used these.)
@@ -337,6 +431,8 @@ CREATE TABLE public.migrations (
     name TEXT NOT NULL,             -- the ledger KEY: Prefix(filename)
     filename TEXT,                  -- v1.5.0 identity; NULL on older rows
     content_sha256 TEXT,            -- v1.5.0 integrity; NULL on older rows
+    status TEXT NOT NULL DEFAULT 'applied',  -- v1.7.0: applied | running | failed
+    "error" TEXT,                   -- v1.7.0: why a no-transaction apply failed
     migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(app, database, schema, name)
 );
@@ -414,6 +510,18 @@ not lexical filename order, so unpadded prefixes are safe.
 normalized prefix, two files sharing a prefix (`002_users.up.sql` +
 `002_roles.up.sql`, or `0042_x` vs `42_y`) would mean the second silently
 never runs. `LoadFromFS` returns an error instead.
+
+**Parent line (v1.7.0):** the first non-blank line of a migration is
+`-- parent: <number> sha256:<digest-of-the-parent's-canonical-body>`, or
+`-- parent: root` for the lowest-numbered file. The whole chain is verified at load.
+Renumbering means `git mv` *and* updating that line — `migratekit relink` does both parts
+of the second half. Headerless files are tolerated with a warning for one minor version.
+
+**Repair rule (v1.7.0):** a migration that adds a constraint over a table that already has
+rows must carry, ABOVE the constraint, the DML that repairs the offending rows — or
+`-- Repair: none-needed <reason>`. Tables created in the same file are exempt. Measuring
+the real data first is how you decide between deleting and backfilling; the gate enforces
+the repair, not the measurement.
 
 ## Template Variables
 

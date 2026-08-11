@@ -40,6 +40,9 @@ const (
 	KindOrderViolation DiscrepancyKind = "pending_sorts_below_applied"
 	// KindLedgerOnly: a ledger row with no migration file behind it.
 	KindLedgerOnly DiscrepancyKind = "ledger_row_without_file"
+	// KindDirtyMigration: a no-transaction migration that failed or was
+	// interrupted, so it may be partially applied. Always a hard error.
+	KindDirtyMigration DiscrepancyKind = "no_transaction_migration_unfinished"
 )
 
 // Discrepancy is one disagreement between the migration files and the ledger,
@@ -61,6 +64,10 @@ type Discrepancy struct {
 	// Blocker is the already-applied migration a KindOrderViolation sorts
 	// below.
 	Blocker string
+	// LedgerStatus is the recorded apply state for a KindDirtyMigration.
+	LedgerStatus string
+	// LedgerError is the recorded failure cause for a KindDirtyMigration.
+	LedgerError string
 }
 
 // Headline is the one-sentence WHAT.
@@ -80,8 +87,19 @@ func (d Discrepancy) Headline() string {
 			who = "an unrecorded file"
 		}
 		return fmt.Sprintf("ledger key %q was applied by %s, which is not in this migration directory", d.Key, who)
+	case KindDirtyMigration:
+		s := fmt.Sprintf("migration %s is %s, not applied: it ran OUTSIDE a transaction and may be PARTIALLY applied", d.File, d.LedgerStatus)
+		if d.LedgerError != "" {
+			return s + fmt.Sprintf(" (recorded cause: %s)", oneLine(d.LedgerError))
+		}
+		return s + " (no cause recorded — the process did not survive to write one)"
 	}
 	return fmt.Sprintf("%s (%s)", d.Kind, d.Key)
+}
+
+// oneLine flattens a multi-line Postgres error so it fits a log line.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // risk is the one-sentence why-you-should-care.
@@ -95,6 +113,8 @@ func (d Discrepancy) risk() string {
 		return "a fresh database runs the two in the opposite order, so this schema would be one nothing can reproduce"
 	case KindLedgerOnly:
 		return "the ledger is a superset of the chain, which is harmless today and a surprise later"
+	case KindDirtyMigration:
+		return "re-running it could repeat DDL that already landed, and skipping it would leave the rest of the file unapplied — only a human can tell which"
 	}
 	return ""
 }
@@ -159,6 +179,17 @@ func (d Discrepancy) causes() [][2]string {
 				"Update the checkout. Do not repair the ledger to match an old tree.",
 			},
 		}
+	case KindDirtyMigration:
+		return [][2]string{
+			{
+				"the DDL actually landed and the process died before the ledger caught up.",
+				fmt.Sprintf("Confirm the change is present, then: migratekit repair resolve %s --applied --reason \"...\"", d.Key),
+			},
+			{
+				"the statement failed and left the table half-changed. A failed CREATE INDEX CONCURRENTLY leaves an INVALID index behind, which keeps being maintained and is never used.",
+				fmt.Sprintf("Undo the partial work first — for a failed concurrent index that is `DROP INDEX <name>` — then: migratekit repair resolve %s --rerun --reason \"...\"  (only safe if the migration is idempotent).", d.Key),
+			},
+		}
 	}
 	return nil
 }
@@ -180,6 +211,8 @@ func (d Discrepancy) explain(hint bool) string {
 		b.WriteString("  This database ran the OLD content and a fresh one will run the new, so the two schemas can diverge with nothing to notice.\n")
 	case KindOrderViolation:
 		b.WriteString("  Applying it now would build a schema no fresh database can reproduce, because a fresh database runs the two in the opposite order.\n")
+	case KindDirtyMigration:
+		b.WriteString("  A no-transaction migration is not atomic. Boot refuses rather than guess whether the DDL landed.\n")
 	}
 	for _, c := range d.causes() {
 		fmt.Fprintf(&b, "  LIKELY CAUSE: %s\n", c[0])
