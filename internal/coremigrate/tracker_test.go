@@ -26,6 +26,8 @@ func TestTracker_Basics(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ADD COLUMN IF NOT EXISTS filename").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migration_repairs").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	if err := tr.Setup(ctx); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

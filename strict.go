@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 )
@@ -28,9 +29,15 @@ import (
 //	IDENTITY  was key N applied by THIS file, or by a different one?
 //	INTEGRITY is the file that claims to have been applied still byte-identical?
 //
-// Both checks are always on. They can only fire on a genuine mismatch: rows
-// written by <=v1.4.0 carry no filename or digest, and an unknown identity is
-// treated as unknown, never as a mismatch.
+// IDENTITY is a hard error: it is the silent-never-runs killer, and the fix
+// (renumber, or adopt a restored ledger) is always available.
+//
+// INTEGRITY is a WARNING by default (Paul, 2026-08-11). The operator who
+// edited an applied migration may have no way back to the old bytes, and
+// refusing to boot over a cosmetic edit is worse than the divergence it warns
+// about. WithStrictContent() restores the v1.5.0 hard error for consumers that
+// want it. Either way the drift is reported by Status and cleared, on the
+// record, by `repair accept-content`.
 //
 // ORDERING is separate and opt-in via WithStrictOrdering(). It refuses to
 // apply a pending migration that sorts below one already applied — an
@@ -38,6 +45,14 @@ import (
 // reproduce. It is opt-in because existing chains legitimately carry gaps and
 // late arrivals that predate the rule; a consumer adopts it when its chain is
 // clean.
+//
+// None of the checks can fire on a legacy ledger: rows written by <=v1.4.0
+// carry no filename or digest, and an unknown identity is treated as unknown,
+// never as a mismatch.
+
+// statusHint is appended to every refusal. A boot error that names a problem
+// and stops is a headache; one that names the verb that resolves it is not.
+const statusHint = "Run `migratekit status` for resolution guidance."
 
 // AppliedRecord is one row of the applied-migrations ledger.
 type AppliedRecord struct {
@@ -64,6 +79,47 @@ func (p *Postgres) WithStrictOrdering() *Postgres {
 	return p
 }
 
+// WithStrictContent turns content drift — an applied migration whose file has
+// been edited since it ran — back into a hard error. The default is a warning
+// (see the integrity note above); this is for consumers whose chain must be
+// byte-reproducible and who would rather not boot than diverge.
+func (p *Postgres) WithStrictContent() *Postgres {
+	p.strictContent = true
+	return p
+}
+
+// WithWarnFunc replaces the sink for warning-severity discrepancies. The
+// default logs them through slog.Default() at warn level. A warning nobody
+// sees is the failure mode this whole package exists to prevent, so the sink
+// is never silent by default — pass func(Discrepancy){} to silence it
+// deliberately.
+func (p *Postgres) WithWarnFunc(fn func(Discrepancy)) *Postgres {
+	p.warn = fn
+	return p
+}
+
+func (p *Postgres) emit(discrepancies []Discrepancy) {
+	warn := p.warn
+	if warn == nil {
+		warn = defaultWarn
+	}
+	for _, d := range discrepancies {
+		if d.Severity == SeverityWarning {
+			warn(d)
+		}
+	}
+}
+
+func defaultWarn(d Discrepancy) {
+	slog.Default().Warn("migratekit: "+d.OneLine(),
+		"kind", string(d.Kind),
+		"migration", d.File,
+		"key", d.Key,
+		"ledger_digest", shortDigest(d.LedgerDigest),
+		"file_digest", shortDigest(d.FileDigest),
+	)
+}
+
 // AppliedRecords returns the applied-migrations ledger keyed by ledger key.
 func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord, error) {
 	rows, err := p.db.QueryContext(ctx,
@@ -87,9 +143,24 @@ func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord
 	return out, rows.Err()
 }
 
-// verifyIdentity checks every loaded migration against the ledger and reports
-// the first violation. migrations must be in apply order.
-func verifyIdentity(migrations []Migration, applied map[string]AppliedRecord, strictOrdering bool) error {
+// checkOptions selects which discrepancies analyze reports and how severe
+// each one is.
+type checkOptions struct {
+	strictOrdering bool
+	strictContent  bool
+	// allowBelow holds ledger keys exempted from the ordering rule by an
+	// explicit operator exception (see ApplyWithOrderingException).
+	allowBelow map[string]bool
+	// includeLedgerOnly reports ledger rows with no file behind them. Useful
+	// in Status, noise during apply.
+	includeLedgerOnly bool
+}
+
+// analyze compares a loaded chain against the ledger and reports every
+// discrepancy it finds, in apply order. migrations must be in apply order.
+func analyze(migrations []Migration, applied map[string]AppliedRecord, opts checkOptions) []Discrepancy {
+	var out []Discrepancy
+
 	for _, m := range migrations {
 		rec, ok := applied[Prefix(m.Name)]
 		if !ok {
@@ -98,26 +169,62 @@ func verifyIdentity(migrations []Migration, applied map[string]AppliedRecord, st
 		// A number applied by a DIFFERENT file: this migration would be
 		// skipped forever, and no later run would ever reconsider it.
 		if rec.Filename != "" && rec.Filename != m.Name {
-			return fmt.Errorf(
-				"migration %s cannot be applied: number %q was already applied by a DIFFERENT file (%s).\n"+
-					"  The ledger is keyed by the number, so %s would be recorded as already applied and its DDL would NEVER run.\n"+
-					"  Renumber %s to an unclaimed number.",
-				m.Name, rec.Key, rec.Filename, m.Name, m.Name)
+			out = append(out, Discrepancy{
+				Kind:           KindNumberMismatch,
+				Severity:       SeverityError,
+				Key:            rec.Key,
+				File:           m.Name,
+				LedgerFilename: rec.Filename,
+				LedgerDigest:   rec.Digest,
+				FileDigest:     ContentDigest(m.Content),
+			})
+			continue
 		}
 		// The same file, edited after it ran. Every database that already
 		// applied it now diverges from a fresh one.
 		if rec.Digest != "" && rec.Digest != ContentDigest(m.Content) {
-			return fmt.Errorf(
-				"migration %s was EDITED after it was applied (content digest %s, ledger has %s).\n"+
-					"  Its DDL has already executed here, so the edit will never run and this database\n"+
-					"  now differs from any database built from the current file. Revert the edit and\n"+
-					"  add a new migration instead.",
-				m.Name, ContentDigest(m.Content)[:12], rec.Digest[:12])
+			severity := SeverityWarning
+			if opts.strictContent {
+				severity = SeverityError
+			}
+			out = append(out, Discrepancy{
+				Kind:           KindContentDrift,
+				Severity:       severity,
+				Key:            rec.Key,
+				File:           m.Name,
+				LedgerFilename: rec.Filename,
+				LedgerDigest:   rec.Digest,
+				FileDigest:     ContentDigest(m.Content),
+			})
 		}
 	}
 
-	if !strictOrdering {
-		return nil
+	if opts.includeLedgerOnly {
+		inTree := map[string]bool{}
+		for _, m := range migrations {
+			inTree[Prefix(m.Name)] = true
+		}
+		var orphans []string
+		for key := range applied {
+			if !inTree[key] {
+				orphans = append(orphans, key)
+			}
+		}
+		sort.Slice(orphans, func(i, j int) bool { return keyLess(orphans[i], orphans[j]) })
+		for _, key := range orphans {
+			rec := applied[key]
+			out = append(out, Discrepancy{
+				Kind:           KindLedgerOnly,
+				Severity:       SeverityInfo,
+				Key:            key,
+				LedgerFilename: rec.Filename,
+				LedgerDigest:   rec.Digest,
+			})
+		}
+	}
+
+	if !opts.strictOrdering {
+		return out
 	}
 
 	// Highest applied migration, by the same order LoadFromFS applies in.
@@ -128,18 +235,34 @@ func verifyIdentity(migrations []Migration, applied map[string]AppliedRecord, st
 		}
 	}
 	if !haveHighest {
-		return nil
+		return out
 	}
 	for _, m := range migrations {
 		if _, ok := applied[Prefix(m.Name)]; ok {
 			continue
 		}
-		if orderBefore(m.Name, highest) {
-			return fmt.Errorf(
-				"migration %s sorts BEFORE %s, which is already applied.\n"+
-					"  Applying it now would build a schema no fresh database can reproduce, because a\n"+
-					"  fresh database runs the two in the opposite order. Renumber %s above %s.",
-				m.Name, highest, m.Name, highest)
+		if !orderBefore(m.Name, highest) {
+			continue
+		}
+		if opts.allowBelow[Prefix(m.Name)] {
+			continue
+		}
+		out = append(out, Discrepancy{
+			Kind:     KindOrderViolation,
+			Severity: SeverityError,
+			Key:      Prefix(m.Name),
+			File:     m.Name,
+			Blocker:  highest,
+		})
+	}
+	return out
+}
+
+// firstError returns the first error-severity discrepancy as an error.
+func firstError(discrepancies []Discrepancy) error {
+	for _, d := range discrepancies {
+		if d.Severity == SeverityError {
+			return fmt.Errorf("%s", d.String())
 		}
 	}
 	return nil
@@ -164,6 +287,32 @@ func orderBefore(a, b string) bool {
 	default:
 		return a < b
 	}
+}
+
+// keyLess orders two ledger keys numerically where possible.
+func keyLess(a, b string) bool {
+	na, aNum := numericPrefix(a)
+	nb, bNum := numericPrefix(b)
+	switch {
+	case aNum && bNum:
+		if na != nb {
+			return na < nb
+		}
+		return a < b
+	case aNum:
+		return true
+	case bNum:
+		return false
+	default:
+		return a < b
+	}
+}
+
+func shortDigest(d string) string {
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
 }
 
 // CheckChain validates a migration chain as a FILE LISTING — no database.

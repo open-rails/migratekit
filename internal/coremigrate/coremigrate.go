@@ -61,9 +61,37 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	// full filename and a content digest makes that detectable. Both are
 	// nullable: rows written by <=v1.4.0 have no identity to check, and a NULL
 	// is treated as "unknown", never as a mismatch.
-	_, err := db.ExecContext(ctx, `
+	if _, err := db.ExecContext(ctx, `
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS filename TEXT;
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
+	`); err != nil {
+		return err
+	}
+	// v1.6.0 repair audit. Operators can rewrite the identity columns above
+	// with `migratekit repair`, which is the point — the checks are worth
+	// nothing if the only way past them is a hand-written UPDATE. What makes
+	// that safe is that every repair lands here in the same transaction: a
+	// repaired ledger is visible history, not an erased one.
+	_, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS public.migration_repairs (
+			id BIGSERIAL PRIMARY KEY,
+			app TEXT NOT NULL,
+			database TEXT NOT NULL,
+			schema TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			verb TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			operator TEXT NOT NULL DEFAULT '',
+			os_user TEXT NOT NULL DEFAULT '',
+			host TEXT NOT NULL DEFAULT '',
+			old_filename TEXT,
+			old_digest TEXT,
+			new_filename TEXT,
+			new_digest TEXT,
+			repaired_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS migration_repairs_scope_idx
+			ON public.migration_repairs (app, database, schema, repaired_at DESC);
 	`)
 	return err
 }
