@@ -49,9 +49,6 @@ type Postgres struct {
 	// strictOrdering refuses to apply a migration that sorts below one
 	// already applied. See WithStrictOrdering.
 	strictOrdering bool
-	// strictContent turns content drift from a warning into an error. See
-	// WithStrictContent.
-	strictContent bool
 	// warn is the sink for warning-severity discrepancies. See WithWarnFunc.
 	warn func(Discrepancy)
 }
@@ -242,10 +239,11 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 	// database is written with. filename/content_sha256 carry the identity
 	// that key cannot express (see verifyIdentity).
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, semantic_sha256)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (app, database, schema, name) DO NOTHING`,
-		p.app, postgresDriver, p.schema, Prefix(m.Name), m.Name, ContentDigest(m.Content)); err != nil {
+		p.app, postgresDriver, p.schema, Prefix(m.Name), m.Name,
+		ContentDigest(m.Content), SemanticContentDigest(m.Content)); err != nil {
 		return err
 	}
 
@@ -280,7 +278,6 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 
 	opts := checkOptions{
 		strictOrdering: p.strictOrdering,
-		strictContent:  p.strictContent,
 		allowBelow:     allowBelow,
 	}
 
@@ -288,6 +285,9 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	// again under it so a racing process cannot slip a claim in between.
 	records, err := p.AppliedRecords(ctx)
 	if err != nil {
+		return err
+	}
+	if err := p.backfillSemanticDigests(ctx, migrations, records); err != nil {
 		return err
 	}
 	discrepancies := analyze(migrations, records, opts)
@@ -319,6 +319,9 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	// Double-check under lock in case another process applied some since our first read
 	records, err = p.AppliedRecords(ctx)
 	if err != nil {
+		return err
+	}
+	if err := p.backfillSemanticDigests(ctx, migrations, records); err != nil {
 		return err
 	}
 	if err := firstError(analyze(migrations, records, opts)); err != nil {

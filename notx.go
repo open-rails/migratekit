@@ -87,6 +87,7 @@ func (r AppliedRecord) isDirty() bool {
 func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairRequest) error {
 	key := Prefix(m.Name)
 	digest := ContentDigest(m.Content)
+	semantic := SemanticContentDigest(m.Content)
 
 	sqlText, err := coremigrate.SubstituteTemplates(m.Content)
 	if err != nil {
@@ -107,11 +108,11 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	// Claim the row BEFORE executing. A process killed mid-run must leave
 	// evidence; an absent row would look like a migration that never started.
 	if _, err := p.db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, semantic_sha256, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (app, database, schema, name)
 		 DO UPDATE SET status = EXCLUDED.status, filename = EXCLUDED.filename, "error" = NULL`,
-		p.app, postgresDriver, p.schema, key, m.Name, digest, StatusRunning); err != nil {
+		p.app, postgresDriver, p.schema, key, m.Name, digest, semantic, StatusRunning); err != nil {
 		return fmt.Errorf("claim %s: %w", m.Name, err)
 	}
 
@@ -133,9 +134,9 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE public.migrations SET status = $5, "error" = NULL, content_sha256 = $6
+		`UPDATE public.migrations SET status = $5, "error" = NULL, content_sha256 = $6, semantic_sha256 = $7
 		  WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
-		p.app, postgresDriver, p.schema, key, StatusApplied, digest); err != nil {
+		p.app, postgresDriver, p.schema, key, StatusApplied, digest, semantic); err != nil {
 		return err
 	}
 	if audit != nil {
@@ -218,6 +219,7 @@ func (p *Postgres) RepairResolve(ctx context.Context, m Migration, mode ResolveM
 	}
 
 	digest := ContentDigest(m.Content)
+	semantic := SemanticContentDigest(m.Content)
 	result := RepairResult{
 		Verb: verb, Key: key,
 		OldFilename: rec.Filename, OldDigest: rec.Digest,
@@ -238,9 +240,9 @@ func (p *Postgres) RepairResolve(ctx context.Context, m Migration, mode ResolveM
 
 	if mode == ResolveApplied {
 		_, err = tx.ExecContext(ctx,
-			`UPDATE public.migrations SET status = $5, "error" = NULL, filename = $6, content_sha256 = $7
+			`UPDATE public.migrations SET status = $5, "error" = NULL, filename = $6, content_sha256 = $7, semantic_sha256 = $8
 			  WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
-			p.app, postgresDriver, p.schema, key, StatusApplied, m.Name, digest)
+			p.app, postgresDriver, p.schema, key, StatusApplied, m.Name, digest, semantic)
 	} else {
 		_, err = tx.ExecContext(ctx,
 			`DELETE FROM public.migrations

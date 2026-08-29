@@ -32,12 +32,10 @@ import (
 // IDENTITY is a hard error: it is the silent-never-runs killer, and the fix
 // (renumber, or adopt a restored ledger) is always available.
 //
-// INTEGRITY is a WARNING by default (Paul, 2026-08-11). The operator who
-// edited an applied migration may have no way back to the old bytes, and
-// refusing to boot over a cosmetic edit is worse than the divergence it warns
-// about. WithStrictContent() restores the v1.5.0 hard error for consumers that
-// want it. Either way the drift is reported by Status and cleared, on the
-// record, by `repair accept-content`.
+// INTEGRITY is always a WARNING. The operator who edited an applied migration
+// may have no way back to the old bytes; refusing to boot cannot repair either
+// schema. Drift is reported by Status and cleared, on the record, by
+// `repair accept-content`.
 //
 // ORDERING is separate and opt-in via WithStrictOrdering(). It refuses to
 // apply a pending migration that sorts below one already applied — an
@@ -64,6 +62,9 @@ type AppliedRecord struct {
 	// Digest is the sha256 of the applied migration's content. Empty for
 	// rows written before v1.5.0.
 	Digest string
+	// SemanticDigest hashes SQL tokens while ignoring comments and formatting.
+	// Empty for rows written before v1.8.0.
+	SemanticDigest string
 	// Status is the apply state: applied, running or failed. Empty for rows
 	// written before v1.7.0, which are applied by construction — only a
 	// no-transaction migration can be anything else.
@@ -85,15 +86,6 @@ func ContentDigest(content string) string {
 // migration already applied. Off by default; see the ordering note above.
 func (p *Postgres) WithStrictOrdering() *Postgres {
 	p.strictOrdering = true
-	return p
-}
-
-// WithStrictContent turns content drift — an applied migration whose file has
-// been edited since it ran — back into a hard error. The default is a warning
-// (see the integrity note above); this is for consumers whose chain must be
-// byte-reproducible and who would rather not boot than diverge.
-func (p *Postgres) WithStrictContent() *Postgres {
-	p.strictContent = true
 	return p
 }
 
@@ -132,7 +124,7 @@ func defaultWarn(d Discrepancy) {
 // AppliedRecords returns the applied-migrations ledger keyed by ledger key.
 func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord, error) {
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT name, COALESCE(filename, ''), COALESCE(content_sha256, ''),
+		`SELECT name, COALESCE(filename, ''), COALESCE(content_sha256, ''), COALESCE(semantic_sha256, ''),
 		        COALESCE(status, ''), COALESCE("error", '')
 		   FROM public.migrations
 		  WHERE app = $1 AND database = $2 AND schema = $3`,
@@ -145,7 +137,7 @@ func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord
 	out := map[string]AppliedRecord{}
 	for rows.Next() {
 		var rec AppliedRecord
-		if err := rows.Scan(&rec.Key, &rec.Filename, &rec.Digest, &rec.Status, &rec.Error); err != nil {
+		if err := rows.Scan(&rec.Key, &rec.Filename, &rec.Digest, &rec.SemanticDigest, &rec.Status, &rec.Error); err != nil {
 			return nil, err
 		}
 		out[rec.Key] = rec
@@ -153,11 +145,38 @@ func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord
 	return out, rows.Err()
 }
 
+// backfillSemanticDigests upgrades an unchanged legacy ledger row. A raw
+// digest match proves we still have the bytes that ran, so recording their
+// token digest is safe and lets later comment/format edits compare cleanly.
+func (p *Postgres) backfillSemanticDigests(ctx context.Context, migrations []Migration,
+	applied map[string]AppliedRecord,
+) error {
+	for _, migration := range migrations {
+		key := Prefix(migration.Name)
+		record, ok := applied[key]
+		if !ok || record.Digest == "" || record.SemanticDigest != "" ||
+			record.Filename != "" && record.Filename != migration.Name ||
+			record.Digest != ContentDigest(migration.Content) {
+			continue
+		}
+		semantic := SemanticContentDigest(migration.Content)
+		if _, err := p.db.ExecContext(ctx,
+			`UPDATE public.migrations SET semantic_sha256 = $1
+			  WHERE app = $2 AND database = $3 AND schema = $4 AND name = $5
+			    AND semantic_sha256 IS NULL`,
+			semantic, p.app, postgresDriver, p.schema, key); err != nil {
+			return err
+		}
+		record.SemanticDigest = semantic
+		applied[key] = record
+	}
+	return nil
+}
+
 // checkOptions selects which discrepancies analyze reports and how severe
 // each one is.
 type checkOptions struct {
 	strictOrdering bool
-	strictContent  bool
 	// allowBelow holds ledger keys exempted from the ordering rule by an
 	// explicit operator exception (see ApplyWithOrderingException).
 	allowBelow map[string]bool
@@ -209,14 +228,11 @@ func analyze(migrations []Migration, applied map[string]AppliedRecord, opts chec
 		}
 		// The same file, edited after it ran. Every database that already
 		// applied it now diverges from a fresh one.
-		if rec.Digest != "" && rec.Digest != ContentDigest(m.Content) {
-			severity := SeverityWarning
-			if opts.strictContent {
-				severity = SeverityError
-			}
+		if rec.Digest != "" && rec.Digest != ContentDigest(m.Content) &&
+			(rec.SemanticDigest == "" || rec.SemanticDigest != SemanticContentDigest(m.Content)) {
 			out = append(out, Discrepancy{
 				Kind:           KindContentDrift,
-				Severity:       severity,
+				Severity:       SeverityWarning,
 				Key:            rec.Key,
 				File:           m.Name,
 				LedgerFilename: rec.Filename,

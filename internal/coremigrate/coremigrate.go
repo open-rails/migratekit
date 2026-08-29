@@ -64,6 +64,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS filename TEXT;
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
+		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS semantic_sha256 TEXT;
 	`); err != nil {
 		return err
 	}

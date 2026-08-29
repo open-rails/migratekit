@@ -126,7 +126,7 @@ pointing at it.
 | What you see | What it means | Resolution |
 |---|---|---|
 | `number "N" was already applied by a DIFFERENT file` **(error)** | Two lanes claimed N; the other one merged first. Your file would be recorded as already applied and its DDL would never run. | Renumber your file to the next free number. Nothing in the database changes. |
-| `migration X was EDITED after it was applied` **(warning — boot proceeds)** | X's bytes changed since it ran here. This database has the old schema, a fresh one gets the new. | Cosmetic edit: `repair accept-content N --reason "…"`. Otherwise revert the file and add a new migration. |
+| `migration X was EDITED after it was applied` **(warning — boot proceeds)** | X's SQL tokens changed since it ran here. This database has the old schema, a fresh one gets the new. | Inspect the diff. Acknowledged intentional change: `repair accept-content N --reason "…"`; otherwise revert and add a new migration. Whitespace/comments are ignored automatically. |
 | `migration X sorts BEFORE Y, which is already applied` **(error, `WithStrictOrdering` only)** | A lane branched below the high-water mark and merged late. | Renumber X above Y. Genuine backport: `apply --allow-below-applied N --reason "…"`, which applies it once and records the deviation. |
 | `migration X is failed, not applied` **(error)** | A `-- migratekit:no-transaction` migration failed or was interrupted, so it may be HALF applied. The ledger holds the state rather than guessing. | Undo the partial work (a failed `CREATE INDEX CONCURRENTLY` leaves an INVALID index — `DROP INDEX` it), then `repair resolve N --rerun --reason "…"`. If the DDL actually landed, `repair resolve N --applied --reason "…"`. |
 | Row 1's error, but **your files are right and the ledger is the wrong side** | A restored backup, an adopted database, or a hand-fixed row: the ledger remembers a tree that no longer exists. | `repair adopt N --reason "…"` — or `repair adopt --all-unmatched --reason "…"` when every row mismatches, which is what a restore actually looks like. |
@@ -180,7 +180,8 @@ is an implementation detail and may change in any release.
 | `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.name`. |
 | `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
 | `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration. **Since v1.7.0 it hashes the CANONICAL BODY** — the file with its own `-- parent:` header removed — so adding a parent line to an applied migration changes no ledger digest. A headerless file hashes exactly as it did in v1.5.0. |
-| `type AppliedRecord struct { Key, Filename, Digest, Status, Error string }` | One ledger row. `Filename`/`Digest` are empty for rows written by ≤v1.4.0; `Status`/`Error` (v1.7.0) are empty for rows written by ≤v1.6.0, which are applied by construction. |
+| `SemanticContentDigest(content string) string` | *(v1.8.0)* Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
+| `type AppliedRecord struct { Key, Filename, Digest, SemanticDigest, Status, Error string }` | One ledger row. `SemanticDigest` is empty for rows written before v1.8.0 and is backfilled when the legacy raw digest still matches. |
 | `Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error)` | *(v1.7.0)* `LoadFromFS` plus options. `RequireParentLinks()` makes a headerless migration an error; `WithChainWarnFunc(fn)` redirects the tolerance warnings. |
 | `VerifyChain(migrations []Migration, opts ...LoadOption) error` | *(v1.7.0)* The parent-link check on an already-loaded chain. |
 | `CheckChainFS(fsys fs.FS, dir string, requireLinks bool) error` | *(v1.7.0)* The CI gate: `CheckChain`'s numbering rules plus parent-link validation, which needs the bytes and not just the names. |
@@ -199,7 +200,6 @@ is an implementation detail and may change in any release.
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |
-| `(*Postgres) WithStrictContent() *Postgres` | *(v1.6.0)* Turn content drift back into a hard error. Default is a warning. |
 | `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | *(v1.6.0)* Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
 | `(*Postgres) Status(ctx, []Migration) (Status, error)` | *(v1.6.0)* Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Read-only apart from `Setup`. |
 | `(*Postgres) RepairAdopt(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Bind the file in the tree as the applied identity for its number. For a ledger that is the stale side. |
@@ -238,8 +238,8 @@ ClickHouse is a separate subpackage so the root package never imports
 
 These behaviors are part of the API and will not change within v1.x:
 
-1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, status, error, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Its shape is stable. Since v1.6.0 `public.migration_repairs` records every repair; prefer `migratekit repair` over editing either table by hand, because only the verbs write the audit row.
-2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename — renaming `001_users.up.sql` to `001_accounts.up.sql` does not re-apply it. Since v1.5.0 the row also records the full filename and a content digest: a number applied by a *different* file is a hard error instead of a silent skip, and an edit to a migration that already ran is reported (a warning since v1.6.0, an error under `WithStrictContent`).
+1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Since v1.6.0 `public.migration_repairs` records every repair.
+2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is always an operator warning; comment/format-only edits compare cleanly through `semantic_sha256`.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
@@ -288,7 +288,8 @@ refused, named the problem, and left the operator with `psql`. v1.6.0 is the oth
 that already ran often cannot restore the old bytes, and a database held down over a
 comment change is a worse outcome than the divergence the check guards against. The boot
 proceeds and emits a warning naming the file, both digests, the risk, and
-`repair accept-content`. `WithStrictContent()` restores the v1.5.0 refusal.
+`repair accept-content`. Content drift has no boot-refusal mode: stopping the
+application cannot repair either the migration file or the already-applied schema.
 
 The other two are unchanged. A number applied by a different file is still a hard error —
 it is the silent-never-runs killer, and its fix (renumber, or adopt) is always available.
@@ -324,6 +325,16 @@ forward, and a link that skips the immediate predecessor (the stale-after-renumb
 file with its own header removed — and that is also what `content_sha256` stores. Adding
 parent lines to already-applied migrations therefore changes no ledger digest: adoption is
 silent, every digest v1.5.0 wrote is still correct, and there is nothing to backfill.
+
+### Changed in v1.8.0 (warning-only semantic drift)
+
+Content drift is now informational in every API and CLI path; the strict-content
+escape hatch is removed. `semantic_sha256` records a PostgreSQL token digest alongside
+the historical byte digest. Existing rows are upgraded automatically when their old
+digest still matches, after which comments, whitespace, and unquoted-identifier case do
+not produce warnings. Real token changes still warn with both raw digests and the audited
+`repair accept-content` path. Identity collisions, ordering violations, and unfinished
+no-transaction migrations remain hard errors.
 
 **Renumbering** is now `git mv` PLUS updating your parent line. The error message says so,
 and `migratekit relink` does it in one command:
@@ -431,6 +442,7 @@ CREATE TABLE public.migrations (
     name TEXT NOT NULL,             -- the ledger KEY: Prefix(filename)
     filename TEXT,                  -- v1.5.0 identity; NULL on older rows
     content_sha256 TEXT,            -- v1.5.0 integrity; NULL on older rows
+    semantic_sha256 TEXT,           -- v1.8.0 token digest; NULL until upgraded
     status TEXT NOT NULL DEFAULT 'applied',  -- v1.7.0: applied | running | failed
     "error" TEXT,                   -- v1.7.0: why a no-transaction apply failed
     migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
