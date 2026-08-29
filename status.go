@@ -32,8 +32,8 @@ const (
 	// KindNumberMismatch: the ledger says this number was applied by a
 	// different file. Hard error — the file in the tree would never run.
 	KindNumberMismatch DiscrepancyKind = "number_applied_by_different_file"
-	// KindContentDrift: an applied migration's file has been edited since it
-	// ran. Warning by default; error under WithStrictContent.
+	// KindContentDrift: an applied migration's SQL tokens changed since it ran.
+	// It is informational and never blocks applying later migrations.
 	KindContentDrift DiscrepancyKind = "applied_migration_edited"
 	// KindOrderViolation: a pending migration sorts below one already
 	// applied. Error under WithStrictOrdering.
@@ -323,7 +323,6 @@ func (p *Postgres) Status(ctx context.Context, migrations []Migration) (Status, 
 
 	st.Discrepancies = analyze(migrations, applied, checkOptions{
 		strictOrdering:    p.strictOrdering,
-		strictContent:     p.strictContent,
 		includeLedgerOnly: true,
 	})
 	sort.SliceStable(st.Discrepancies, func(i, j int) bool {

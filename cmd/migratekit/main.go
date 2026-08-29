@@ -64,7 +64,6 @@ COMMON FLAGS
   -dir string       directory holding *.up.sql (default ".")
   -schema string    target schema, as passed to WithSchema
   -strict-ordering  refuse a pending migration that sorts below an applied one
-  -strict-content   treat an edited applied migration as an error, not a warning
 
 REPAIR FLAGS
   --reason string    why (required; recorded verbatim in the audit row)
@@ -101,7 +100,6 @@ type opts struct {
 	dir            string
 	schema         string
 	strictOrdering bool
-	strictContent  bool
 
 	reason       string
 	operator     string
@@ -165,7 +163,6 @@ func run(args []string) error {
 	fs.StringVar(&o.dir, "dir", ".", "directory holding *.up.sql")
 	fs.StringVar(&o.schema, "schema", "", "target schema")
 	fs.BoolVar(&o.strictOrdering, "strict-ordering", false, "refuse a pending migration below an applied one")
-	fs.BoolVar(&o.strictContent, "strict-content", false, "treat an edited applied migration as an error")
 	fs.StringVar(&o.reason, "reason", "", "why this repair is being made")
 	fs.StringVar(&o.operator, "operator", "", "who is making this repair")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "compute the repair, write nothing")
@@ -225,9 +222,6 @@ func run(args []string) error {
 	}
 	if o.strictOrdering {
 		m = m.WithStrictOrdering()
-	}
-	if o.strictContent {
-		m = m.WithStrictContent()
 	}
 
 	req := migratekit.RepairRequest{Reason: o.reason, Operator: o.operator, DryRun: o.dryRun}

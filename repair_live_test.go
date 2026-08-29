@@ -178,7 +178,7 @@ func TestRepair_AdoptAllUnmatched(t *testing.T) {
 }
 
 // TestRepair_AcceptContentClearsTheDriftWarning is Paul's 2026-08-11 ruling in
-// full: an edited applied migration BOOTS, loudly. The operator who cannot
+// full: a semantic edit to an applied migration BOOTS, loudly. The operator who cannot
 // restore the old bytes is not locked out — and the acknowledgement is a
 // recorded act, not a silence.
 func TestRepair_AcceptContentClearsTheDriftWarning(t *testing.T) {
@@ -191,8 +191,8 @@ func TestRepair_AcceptContentClearsTheDriftWarning(t *testing.T) {
 		t.Fatalf("initial apply: %v", err)
 	}
 
-	// A comment added to a migration that already ran.
-	edited := []Migration{{Name: "0001_init.up.sql", Content: "-- th#1780: what this table is for\n" + orig[0].Content}}
+	// An actual token/DDL change to a migration that already ran.
+	edited := []Migration{{Name: "0001_init.up.sql", Content: `CREATE TABLE mk_repair_content_a (id int, note text)`}}
 
 	var warnings []Discrepancy
 	err := NewPostgres(db, app).
@@ -226,15 +226,8 @@ func TestRepair_AcceptContentClearsTheDriftWarning(t *testing.T) {
 		t.Fatalf("status must surface the drift: %+v", st.Discrepancies)
 	}
 
-	// A consumer that wants the v1.5.0 behaviour still has it.
-	if err := NewPostgres(db, app).WithStrictContent().ApplyMigrations(ctx, edited); err == nil {
-		t.Fatal("WithStrictContent must still refuse")
-	} else if !strings.Contains(err.Error(), "EDITED") {
-		t.Errorf("the strict refusal should still say the file was edited; got: %v", err)
-	}
-
 	res, err := NewPostgres(db, app).RepairAcceptContent(ctx, edited[0],
-		RepairRequest{Reason: "comment only; DDL byte-identical, diffed by hand"})
+		RepairRequest{Reason: "reviewed intended baseline change; existing database reconciled separately"})
 	if err != nil {
 		t.Fatalf("repair accept-content: %v", err)
 	}
@@ -245,9 +238,8 @@ func TestRepair_AcceptContentClearsTheDriftWarning(t *testing.T) {
 	warnings = nil
 	if err := NewPostgres(db, app).
 		WithWarnFunc(func(d Discrepancy) { warnings = append(warnings, d) }).
-		WithStrictContent().
 		ApplyMigrations(ctx, edited); err != nil {
-		t.Fatalf("the warning must be cleared, even under strict content: %v", err)
+		t.Fatalf("the warning must be cleared: %v", err)
 	}
 	if len(warnings) != 0 {
 		t.Fatalf("accept-content must SILENCE the warning, got %d", len(warnings))

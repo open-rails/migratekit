@@ -196,7 +196,7 @@ func (p *Postgres) RepairAdopt(ctx context.Context, m Migration, req RepairReque
 	if rec.Filename == m.Name && rec.Digest == digest {
 		return RepairResult{}, fmt.Errorf("%w: key %q already records %s at digest %s", ErrNothingToRepair, key, m.Name, shortDigest(digest))
 	}
-	return p.writeRepair(ctx, "repair adopt", rec, m.Name, digest, req)
+	return p.writeRepair(ctx, "repair adopt", rec, m.Name, digest, SemanticContentDigest(m.Content), req)
 }
 
 // RepairAdoptAllUnmatched adopts EVERY ledger row whose identity disagrees
@@ -225,7 +225,7 @@ func (p *Postgres) RepairAdoptAllUnmatched(ctx context.Context, migrations []Mig
 		if rec.Filename == m.Name && rec.Digest == digest {
 			continue
 		}
-		res, err := p.writeRepair(ctx, "repair adopt --all-unmatched", rec, m.Name, digest, req)
+		res, err := p.writeRepair(ctx, "repair adopt --all-unmatched", rec, m.Name, digest, SemanticContentDigest(m.Content), req)
 		if err != nil {
 			return results, err
 		}
@@ -269,13 +269,15 @@ func (p *Postgres) RepairAcceptContent(ctx context.Context, m Migration, req Rep
 	if rec.Digest == digest {
 		return RepairResult{}, fmt.Errorf("%w: key %q already records digest %s", ErrNothingToRepair, key, shortDigest(digest))
 	}
-	return p.writeRepair(ctx, "repair accept-content", rec, m.Name, digest, req)
+	return p.writeRepair(ctx, "repair accept-content", rec, m.Name, digest, SemanticContentDigest(m.Content), req)
 }
 
 // writeRepair updates one ledger identity row and records the audit row in the
 // SAME transaction. A repair that lands without its audit row, or an audit row
 // for a repair that did not land, would both be worse than no repair at all.
-func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedRecord, filename, digest string, req RepairRequest) (RepairResult, error) {
+func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedRecord,
+	filename, digest, semantic string, req RepairRequest,
+) (RepairResult, error) {
 	res := RepairResult{
 		Verb:        verb,
 		Key:         old.Key,
@@ -296,9 +298,9 @@ func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedReco
 	defer tx.Rollback()
 
 	tag, err := tx.ExecContext(ctx,
-		`UPDATE public.migrations SET filename = $1, content_sha256 = $2
-		  WHERE app = $3 AND database = $4 AND schema = $5 AND name = $6`,
-		filename, digest, p.app, postgresDriver, p.schema, old.Key)
+		`UPDATE public.migrations SET filename = $1, content_sha256 = $2, semantic_sha256 = $3
+		  WHERE app = $4 AND database = $5 AND schema = $6 AND name = $7`,
+		filename, digest, semantic, p.app, postgresDriver, p.schema, old.Key)
 	if err != nil {
 		return res, err
 	}
@@ -388,7 +390,6 @@ func (p *Postgres) ApplyWithOrderingException(ctx context.Context, migrations []
 		}
 		return firstError(analyze(migrations, records, checkOptions{
 			strictOrdering: p.strictOrdering,
-			strictContent:  p.strictContent,
 			allowBelow:     exempt,
 		}))
 	}

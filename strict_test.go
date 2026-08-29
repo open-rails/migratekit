@@ -90,10 +90,7 @@ func TestAnalyze(t *testing.T) {
 		}
 	})
 
-	// Paul, 2026-08-11: an operator who edited an applied migration may have
-	// no way back to the old bytes, so this warns and boots. WithStrictContent
-	// is the opt-in for consumers who would rather not boot.
-	t.Run("edited applied migration warns by default and errors under strict content", func(t *testing.T) {
+	t.Run("edited applied migration always warns and never blocks", func(t *testing.T) {
 		applied := map[string]AppliedRecord{
 			"2": {Key: "2", Filename: "0002_lane_a.up.sql", Digest: ContentDigest("A")},
 		}
@@ -112,15 +109,23 @@ func TestAnalyze(t *testing.T) {
 			}
 		}
 
-		strict := only(analyze(chain, applied, checkOptions{strictContent: true}))
-		if strict.Severity != SeverityError {
-			t.Fatal("WithStrictContent must restore the hard error")
+	})
+
+	t.Run("cosmetic edit matches semantic digest", func(t *testing.T) {
+		original := "CREATE TABLE example (id bigint);"
+		formatted := "-- comment\ncreate  table EXAMPLE( id BIGINT );"
+		applied := map[string]AppliedRecord{
+			"2": {Key: "2", Filename: "0002_a.up.sql", Digest: ContentDigest(original),
+				SemanticDigest: SemanticContentDigest(original)},
+		}
+		if ds := analyze([]Migration{mig("0002_a.up.sql", formatted)}, applied, checkOptions{}); len(ds) != 0 {
+			t.Fatalf("cosmetic SQL edit should be clean, got: %v", ds)
 		}
 	})
 
 	t.Run("legacy row without identity is not a mismatch", func(t *testing.T) {
 		applied := map[string]AppliedRecord{"2": {Key: "2"}}
-		if ds := analyze([]Migration{mig("0002_anything.up.sql", "whatever")}, applied, checkOptions{strictContent: true}); len(ds) != 0 {
+		if ds := analyze([]Migration{mig("0002_anything.up.sql", "whatever")}, applied, checkOptions{}); len(ds) != 0 {
 			t.Fatalf("pre-v1.5.0 rows carry no identity and must not fail: %v", ds)
 		}
 	})

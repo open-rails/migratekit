@@ -71,8 +71,7 @@ func TestStrict_NumberReusedByDifferentFile(t *testing.T) {
 // v1.6.0 (Paul, 2026-08-11) reports it as a WARNING rather than refusing the
 // boot: the operator who made the edit may have no way back to the old bytes,
 // and a database held down over a comment change is a worse outcome than the
-// divergence risk. WithStrictContent keeps the v1.5.0 refusal for consumers
-// that want it. Either way the drift is never silent.
+// divergence risk. The drift is visible but never a boot refusal.
 func TestStrict_AppliedMigrationEdited(t *testing.T) {
 	const app = "mk_strict_edit"
 	db, ctx := strictTestDB(t, app)
@@ -80,6 +79,28 @@ func TestStrict_AppliedMigrationEdited(t *testing.T) {
 	orig := []Migration{{Name: "0001_init.up.sql", Content: `CREATE TABLE mk_strict_edit_a (id int)`}}
 	if err := NewPostgres(db, app).ApplyMigrations(ctx, orig); err != nil {
 		t.Fatalf("initial apply: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE public.migrations SET semantic_sha256 = NULL WHERE app = $1`, app); err != nil {
+		t.Fatalf("plant legacy row: %v", err)
+	}
+	if err := NewPostgres(db, app).ApplyMigrations(ctx, orig); err != nil {
+		t.Fatalf("legacy semantic digest backfill: %v", err)
+	}
+	var semantic string
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(semantic_sha256, '') FROM public.migrations WHERE app = $1`, app).Scan(&semantic); err != nil || semantic == "" {
+		t.Fatalf("semantic digest was not backfilled: value=%q err=%v", semantic, err)
+	}
+	cosmetic := []Migration{{Name: "0001_init.up.sql", Content: "-- comment\ncreate table MK_STRICT_EDIT_A(id INT)"}}
+	var cosmeticWarnings []Discrepancy
+	if err := NewPostgres(db, app).
+		WithWarnFunc(func(d Discrepancy) { cosmeticWarnings = append(cosmeticWarnings, d) }).
+		ApplyMigrations(ctx, cosmetic); err != nil {
+		t.Fatalf("cosmetic edit: %v", err)
+	}
+	if len(cosmeticWarnings) != 0 {
+		t.Fatalf("cosmetic edit emitted drift warning: %+v", cosmeticWarnings)
 	}
 
 	edited := []Migration{{Name: "0001_init.up.sql", Content: `CREATE TABLE mk_strict_edit_a (id int, extra text)`}}
@@ -97,13 +118,6 @@ func TestStrict_AppliedMigrationEdited(t *testing.T) {
 		t.Errorf("warning should say the migration was edited; got: %v", warnings[0])
 	}
 
-	err := NewPostgres(db, app).WithStrictContent().ApplyMigrations(ctx, edited)
-	if err == nil {
-		t.Fatal("WithStrictContent must refuse an edit to an applied migration")
-	}
-	if !strings.Contains(err.Error(), "EDITED") {
-		t.Errorf("error should say the migration was edited; got: %v", err)
-	}
 }
 
 // TestStrict_OutOfOrderRefused covers the opt-in ordering rule: a migration
