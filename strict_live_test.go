@@ -32,7 +32,7 @@ func strictTestDB(t *testing.T, app string) (*sql.DB, context.Context) {
 		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS `+app+`_b`)
 	}
 	m := NewPostgres(db, app)
-	if err := m.Setup(ctx); err != nil {
+	if err := m.ensureSetup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	clean()

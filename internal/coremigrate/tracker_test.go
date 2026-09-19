@@ -2,10 +2,36 @@ package coremigrate
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 )
+
+func TestEnsurePublicMigrationsTableRollsBackSetup(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock\\(\\$1\\)").
+		WithArgs(MigrationSetupLockKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
+		WillReturnError(errors.New("injected setup failure"))
+	mock.ExpectRollback()
+
+	if err := EnsurePublicMigrationsTable(context.Background(), db); err == nil {
+		t.Fatal("expected setup failure")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
 
 func TestTracker_Basics(t *testing.T) {
 	ctx := context.Background()
@@ -18,6 +44,10 @@ func TestTracker_Basics(t *testing.T) {
 
 	tr := NewTracker(db)
 
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock\\(\\$1\\)").
+		WithArgs(MigrationSetupLockKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
@@ -30,6 +60,7 @@ func TestTracker_Basics(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migration_repairs").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
 	if err := tr.Setup(ctx); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}

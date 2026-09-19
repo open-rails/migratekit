@@ -193,10 +193,11 @@ is an implementation detail and may change in any release.
 | Symbol | Contract |
 |---|---|
 | `NewPostgres(db *sql.DB, app string) *Postgres` | Migrator for one app's migrations. Never closes `db`. |
+| `NewPostgresFromPGXPool(pool *pgxpool.Pool, app string) (*Postgres, error)` | Creates an isolated, two-connection migration handle from a host pgx pool. The returned migrator owns that handle; call `Close` when done. The host pool is never used or mutated. |
+| `(*Postgres) Close() error` | Closes the isolated database handle created by `NewPostgresFromPGXPool`; no-op for `NewPostgres` values. |
 | `(*Postgres) WithSchema(schema string, rewriteFrom ...string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Optional `rewriteFrom` canonical schema names are rewritten to `schema` in migration SQL before execution, for portable hard-qualified app DDL such as `openrails.foo`. Tracking stays in `public.migrations`. |
-| `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: ensures the tracking table, applies every unapplied migration in order under the advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
+| `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: atomically initializes/upgrades the tracking tables under the global bootstrap lock, then applies every unapplied migration in order under the migration advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
 | `(*Postgres) Applied(ctx) ([]string, error)` | Recorded migration names (normalized prefixes) for this app, `database='postgres'`. |
-| `(*Postgres) Setup(ctx) error` | Ensures `public.migrations` exists (idempotent). `ApplyMigrations` calls it for you. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |

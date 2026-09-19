@@ -180,7 +180,7 @@ func (p *Postgres) RepairAdopt(ctx context.Context, m Migration, req RepairReque
 	if err := req.validate("repair adopt"); err != nil {
 		return RepairResult{}, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return RepairResult{}, err
 	}
 	applied, err := p.AppliedRecords(ctx)
@@ -207,7 +207,7 @@ func (p *Postgres) RepairAdoptAllUnmatched(ctx context.Context, migrations []Mig
 	if err := req.validate("repair adopt --all-unmatched"); err != nil {
 		return nil, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return nil, err
 	}
 	applied, err := p.AppliedRecords(ctx)
@@ -246,7 +246,7 @@ func (p *Postgres) RepairAcceptContent(ctx context.Context, m Migration, req Rep
 	if err := req.validate("repair accept-content"); err != nil {
 		return RepairResult{}, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return RepairResult{}, err
 	}
 	applied, err := p.AppliedRecords(ctx)
@@ -334,7 +334,7 @@ func nullable(s string) any {
 
 // RepairHistory returns this app's repair audit trail, newest first.
 func (p *Postgres) RepairHistory(ctx context.Context) ([]RepairRecord, error) {
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return nil, err
 	}
 	rows, err := p.db.QueryContext(ctx,
@@ -381,7 +381,7 @@ func (p *Postgres) ApplyWithOrderingException(ctx context.Context, migrations []
 		exempt[Prefix(a)] = true
 	}
 	if req.DryRun {
-		if err := p.Setup(ctx); err != nil {
+		if err := p.ensureSetup(ctx); err != nil {
 			return err
 		}
 		records, err := p.AppliedRecords(ctx)

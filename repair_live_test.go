@@ -34,7 +34,7 @@ func repairTestDB(t *testing.T, app string, tables ...string) (*sql.DB, context.
 			_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS `+tbl)
 		}
 	}
-	if err := NewPostgres(db, app).Setup(ctx); err != nil {
+	if err := NewPostgres(db, app).ensureSetup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	clean()

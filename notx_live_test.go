@@ -196,7 +196,7 @@ func liveDB(t *testing.T, app string) (*sql.DB, string) {
 			}
 		}
 	}
-	_ = NewPostgres(db, app).Setup(ctx)
+	_ = NewPostgres(db, app).ensureSetup(ctx)
 	clean()
 	t.Cleanup(func() { clean(); db.Close() })
 	return db, app

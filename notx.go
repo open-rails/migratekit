@@ -202,7 +202,7 @@ func (p *Postgres) RepairResolve(ctx context.Context, m Migration, mode ResolveM
 	if err := req.validate(verb); err != nil {
 		return RepairResult{}, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return RepairResult{}, err
 	}
 	applied, err := p.AppliedRecords(ctx)

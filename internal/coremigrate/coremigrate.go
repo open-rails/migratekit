@@ -12,16 +12,34 @@ import (
 	"strings"
 )
 
-// EnsurePublicMigrationsTable creates/upgrades the tracker table. The tracker
+// MigrationSetupLockKey serializes initialization and upgrades of the shared
+// public.migrations tracker. Postgres migrations use the same key for their
+// application lock, but setup must acquire it first because the tracker may
+// not exist yet.
+const MigrationSetupLockKey int64 = 7592348109
+
+// EnsurePublicMigrationsTable atomically creates/upgrades the tracker tables
+// under the shared bootstrap advisory lock. The tracker
 // identity includes `schema` because WithSchema places tables in different
 // schemas of the SAME database: without it, the same app applied to two schemas
 // (e.g. doujins.* and hentai0.* sharing one DB) would record under one identity
 // and the second schema would never get its tables. schema=” is the stamp for
 // no-WithSchema groups only — Applied() matches schemas exactly, no wildcard.
 func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("migration tracker: db is nil")
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, MigrationSetupLockKey); err != nil {
+		return err
+	}
 	// Fresh installs get the full shape (constraint auto-named
 	// migrations_app_database_schema_name_key).
-	if _, err := db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS public.migrations (
 			id BIGSERIAL PRIMARY KEY,
 			app TEXT NOT NULL,
@@ -35,13 +53,13 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	// Upgrade path for tables created before the schema column existed.
-	if _, err := db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS schema TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	// Widen the unique key from (app, database, name) to include schema.
 	// Idempotent: swap only if the old constraint is still present.
-	if _, err := db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		DO $$
 		BEGIN
 			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_name_key') THEN
@@ -61,7 +79,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	// full filename and a content digest makes that detectable. Both are
 	// nullable: rows written by <=v1.4.0 have no identity to check, and a NULL
 	// is treated as "unknown", never as a mismatch.
-	if _, err := db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS filename TEXT;
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS semantic_sha256 TEXT;
@@ -74,7 +92,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	// 'applied' means every existing row, and every transactional insert, is
 	// complete by construction — nothing to backfill, and the transactional
 	// path stays one atomic insert.
-	if _, err := db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'applied';
 		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS "error" TEXT;
 	`); err != nil {
@@ -85,7 +103,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	// nothing if the only way past them is a hand-written UPDATE. What makes
 	// that safe is that every repair lands here in the same transaction: a
 	// repaired ledger is visible history, not an erased one.
-	_, err := db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS public.migration_repairs (
 			id BIGSERIAL PRIMARY KEY,
 			app TEXT NOT NULL,
@@ -106,7 +124,10 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS migration_repairs_scope_idx
 			ON public.migration_repairs (app, database, schema, repaired_at DESC);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SubstituteTemplates replaces template variables in SQL with environment

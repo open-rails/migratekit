@@ -291,7 +291,7 @@ func (s Status) Report() string {
 func (p *Postgres) Status(ctx context.Context, migrations []Migration) (Status, error) {
 	st := Status{App: p.app, Schema: p.schema}
 
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return st, err
 	}
 	applied, err := p.AppliedRecords(ctx)
