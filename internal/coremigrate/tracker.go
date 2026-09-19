@@ -38,7 +38,7 @@ func (t *Tracker) Applied(ctx context.Context, app string, database string) ([]s
 		return nil, fmt.Errorf("postgres tracker: db is nil")
 	}
 	rows, err := t.db.QueryContext(ctx,
-		`SELECT name FROM public.migrations WHERE app = $1 AND database = $2 ORDER BY name`,
+		`SELECT sequence FROM public.migrations WHERE app = $1 AND database = $2 ORDER BY sequence`,
 		app, database,
 	)
 	if err != nil {
@@ -57,13 +57,13 @@ func (t *Tracker) Applied(ctx context.Context, app string, database string) ([]s
 	return names, rows.Err()
 }
 
-func (t *Tracker) RecordApplied(ctx context.Context, app string, database string, name string) error {
+func (t *Tracker) RecordApplied(ctx context.Context, app string, database string, sequence string) error {
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
 	_, err := t.db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-		app, database, name,
+		`INSERT INTO public.migrations (app, database, sequence) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+		app, database, sequence,
 	)
 	return err
 }

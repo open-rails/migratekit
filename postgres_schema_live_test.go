@@ -60,7 +60,7 @@ func TestPostgres_SchemaAwareTracking(t *testing.T) {
 	// Hard cut: a schema-less row is the stamp for no-WithSchema groups, NOT a
 	// wildcard. It must not count as applied for s3, so s3 gets the table.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, name) VALUES ($1, 'postgres', '1')`, app); err != nil {
+		`INSERT INTO public.migrations (app, database, sequence) VALUES ($1, 'postgres', '1')`, app); err != nil {
 		t.Fatalf("seed schema-less row: %v", err)
 	}
 	if err := NewPostgres(db, app).WithSchema(s3).ApplyMigrations(ctx, mig); err != nil {

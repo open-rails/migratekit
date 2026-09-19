@@ -124,7 +124,7 @@ func defaultWarn(d Discrepancy) {
 // AppliedRecords returns the applied-migrations ledger keyed by ledger key.
 func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord, error) {
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT name, COALESCE(filename, ''), COALESCE(content_sha256, ''), COALESCE(semantic_sha256, ''),
+		`SELECT sequence, COALESCE(filename, ''), COALESCE(content_sha256, ''), COALESCE(semantic_sha256, ''),
 		        COALESCE(status, ''), COALESCE("error", '')
 		   FROM public.migrations
 		  WHERE app = $1 AND database = $2 AND schema = $3`,
@@ -162,7 +162,7 @@ func (p *Postgres) backfillSemanticDigests(ctx context.Context, migrations []Mig
 		semantic := SemanticContentDigest(migration.Content)
 		if _, err := p.db.ExecContext(ctx,
 			`UPDATE public.migrations SET semantic_sha256 = $1
-			  WHERE app = $2 AND database = $3 AND schema = $4 AND name = $5
+			  WHERE app = $2 AND database = $3 AND schema = $4 AND sequence = $5
 			    AND semantic_sha256 IS NULL`,
 			semantic, p.app, postgresDriver, p.schema, key); err != nil {
 			return err
@@ -256,12 +256,52 @@ func analyze(migrations []Migration, applied map[string]AppliedRecord, opts chec
 		sort.Slice(orphans, func(i, j int) bool { return keyLess(orphans[i], orphans[j]) })
 		for _, key := range orphans {
 			rec := applied[key]
+			if rec.isDirty() {
+				out = append(out, Discrepancy{
+					Kind:           KindDirtyMigration,
+					Severity:       SeverityError,
+					Key:            key,
+					File:           rec.Filename,
+					LedgerFilename: rec.Filename,
+					LedgerDigest:   rec.Digest,
+					LedgerStatus:   rec.Status,
+					LedgerError:    rec.Error,
+				})
+				continue
+			}
 			out = append(out, Discrepancy{
 				Kind:           KindLedgerOnly,
 				Severity:       SeverityInfo,
 				Key:            key,
 				LedgerFilename: rec.Filename,
 				LedgerDigest:   rec.Digest,
+			})
+		}
+	}
+
+	// ApplyMigrations intentionally omits ledger-only informational rows from
+	// its analysis, but a dirty row is never informational. If its migration
+	// file was removed or renamed, still block startup: silently treating an
+	// unfinished no-transaction apply as an unrelated orphan would permit a
+	// later migration to run on an unknown schema.
+	if !opts.includeLedgerOnly {
+		inTree := make(map[string]bool, len(migrations))
+		for _, m := range migrations {
+			inTree[Prefix(m.Name)] = true
+		}
+		for key, rec := range applied {
+			if inTree[key] || !rec.isDirty() {
+				continue
+			}
+			out = append(out, Discrepancy{
+				Kind:           KindDirtyMigration,
+				Severity:       SeverityError,
+				Key:            key,
+				File:           rec.Filename,
+				LedgerFilename: rec.Filename,
+				LedgerDigest:   rec.Digest,
+				LedgerStatus:   rec.Status,
+				LedgerError:    rec.Error,
 			})
 		}
 	}

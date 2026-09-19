@@ -108,9 +108,9 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	// Claim the row BEFORE executing. A process killed mid-run must leave
 	// evidence; an absent row would look like a migration that never started.
 	if _, err := p.db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, semantic_sha256, status)
+		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256, status)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		 ON CONFLICT (app, database, schema, name)
+		 ON CONFLICT (app, database, schema, sequence)
 		 DO UPDATE SET status = EXCLUDED.status, filename = EXCLUDED.filename, "error" = NULL`,
 		p.app, postgresDriver, p.schema, key, m.Name, digest, semantic, StatusRunning); err != nil {
 		return fmt.Errorf("claim %s: %w", m.Name, err)
@@ -120,7 +120,7 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	if execErr != nil {
 		_, updErr := p.db.ExecContext(ctx,
 			`UPDATE public.migrations SET status = $5, "error" = $6
-			  WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
+			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
 			p.app, postgresDriver, p.schema, key, StatusFailed, execErr.Error())
 		return errors.Join(fmt.Errorf(
 			"migration %s failed OUTSIDE a transaction and may be PARTIALLY applied: %w\n"+
@@ -135,7 +135,7 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE public.migrations SET status = $5, "error" = NULL, content_sha256 = $6, semantic_sha256 = $7
-		  WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
+		  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
 		p.app, postgresDriver, p.schema, key, StatusApplied, digest, semantic); err != nil {
 		return err
 	}
@@ -241,12 +241,12 @@ func (p *Postgres) RepairResolve(ctx context.Context, m Migration, mode ResolveM
 	if mode == ResolveApplied {
 		_, err = tx.ExecContext(ctx,
 			`UPDATE public.migrations SET status = $5, "error" = NULL, filename = $6, content_sha256 = $7, semantic_sha256 = $8
-			  WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
+			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
 			p.app, postgresDriver, p.schema, key, StatusApplied, m.Name, digest, semantic)
 	} else {
 		_, err = tx.ExecContext(ctx,
 			`DELETE FROM public.migrations
-			  WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
+			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
 			p.app, postgresDriver, p.schema, key)
 	}
 	if err != nil {

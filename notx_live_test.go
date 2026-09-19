@@ -219,7 +219,7 @@ func auditedVerb(t *testing.T, db *sql.DB, app, key, verb string) bool {
 	t.Helper()
 	var n int
 	err := db.QueryRowContext(context.Background(),
-		`SELECT count(*) FROM public.migration_repairs WHERE app = $1 AND name = $2 AND verb = $3`,
+		`SELECT count(*) FROM public.migration_repairs WHERE app = $1 AND sequence = $2 AND verb = $3`,
 		app, key, verb).Scan(&n)
 	if err != nil {
 		t.Fatalf("audit query: %v", err)

@@ -170,10 +170,10 @@ func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
 	rows, err := p.db.QueryContext(ctx,
 		// COALESCE(status,'applied'): a row that is still running, or that
 		// failed half-applied, is NOT proof of application — see notx.go.
-		`SELECT name FROM public.migrations
+		`SELECT sequence FROM public.migrations
 		  WHERE app = $1 AND database = $2 AND schema = $3
 		    AND COALESCE(status, 'applied') = 'applied'
-		  ORDER BY name`,
+		  ORDER BY sequence`,
 		p.app, postgresDriver, p.schema)
 	if err != nil {
 		return nil, err
@@ -278,13 +278,13 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 		return err
 	}
 
-	// `name` stays Prefix(m.Name) — it is the ledger key every existing
+	// `sequence` stores Prefix(m.Name) — it is the ledger key every existing
 	// database is written with. filename/content_sha256 carry the identity
 	// that key cannot express (see verifyIdentity).
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, semantic_sha256)
+		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 ON CONFLICT (app, database, schema, name) DO NOTHING`,
+		 ON CONFLICT (app, database, schema, sequence) DO NOTHING`,
 		p.app, postgresDriver, p.schema, Prefix(m.Name), m.Name,
 		ContentDigest(m.Content), SemanticContentDigest(m.Content)); err != nil {
 		return err

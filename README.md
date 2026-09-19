@@ -177,7 +177,7 @@ is an implementation detail and may change in any release.
 |---|---|
 | `type Migration struct { Name, Content string }` | One SQL migration: filename + raw file content. |
 | `LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error)` | Loads every `*.up.sql` in `dir` (default `"."`), ordered by numeric prefix. Errors on duplicate normalized prefixes. Only the first `dir` element is used. |
-| `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.name`. |
+| `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.sequence`. |
 | `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
 | `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration. **Since v1.7.0 it hashes the CANONICAL BODY** — the file with its own `-- parent:` header removed — so adding a parent line to an applied migration changes no ledger digest. A headerless file hashes exactly as it did in v1.5.0. |
 | `SemanticContentDigest(content string) string` | *(v1.8.0)* Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
@@ -239,7 +239,7 @@ ClickHouse is a separate subpackage so the root package never imports
 
 These behaviors are part of the API and will not change within v1.x:
 
-1. **Tracking table**: `public.migrations (id, app, database, schema, name, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, name))` with `database` ∈ {`postgres`, `clickhouse`}. Since v1.6.0 `public.migration_repairs` records every repair.
+1. **Tracking table**: `public.migrations (id, app, database, schema, sequence, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, sequence))` with `database` ∈ {`postgres`, `clickhouse`}. Since v1.6.0 `public.migration_repairs` records every repair.
 2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is always an operator warning; comment/format-only edits compare cleanly through `semantic_sha256`.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
@@ -440,14 +440,14 @@ CREATE TABLE public.migrations (
     app TEXT NOT NULL,
     database TEXT NOT NULL,
     schema TEXT NOT NULL DEFAULT '',
-    name TEXT NOT NULL,             -- the ledger KEY: Prefix(filename)
+    sequence TEXT NOT NULL,         -- the ledger KEY: Prefix(filename)
     filename TEXT,                  -- v1.5.0 identity; NULL on older rows
     content_sha256 TEXT,            -- v1.5.0 integrity; NULL on older rows
     semantic_sha256 TEXT,           -- v1.8.0 token digest; NULL until upgraded
     status TEXT NOT NULL DEFAULT 'applied',  -- v1.7.0: applied | running | failed
     "error" TEXT,                   -- v1.7.0: why a no-transaction apply failed
     migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(app, database, schema, name)
+    UNIQUE(app, database, schema, sequence)
 );
 
 -- v1.6.0: every `migratekit repair` lands here, in the same transaction as the
@@ -458,7 +458,7 @@ CREATE TABLE public.migration_repairs (
     app TEXT NOT NULL,
     database TEXT NOT NULL,
     schema TEXT NOT NULL DEFAULT '',
-    name TEXT NOT NULL,             -- the ledger key repaired
+    sequence TEXT NOT NULL,         -- the ledger key repaired
     verb TEXT NOT NULL,
     reason TEXT NOT NULL,
     operator TEXT NOT NULL DEFAULT '',

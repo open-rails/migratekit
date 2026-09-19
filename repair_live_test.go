@@ -48,7 +48,7 @@ func stampLedger(t *testing.T, db *sql.DB, ctx context.Context, app, key, filena
 	t.Helper()
 	res, err := db.ExecContext(ctx,
 		`UPDATE public.migrations SET filename = $1, content_sha256 = $2
-		  WHERE app = $3 AND database = 'postgres' AND schema = '' AND name = $4`,
+		  WHERE app = $3 AND database = 'postgres' AND schema = '' AND sequence = $4`,
 		filename, digest, app, key)
 	if err != nil {
 		t.Fatalf("stamp ledger: %v", err)
@@ -429,7 +429,7 @@ func TestStatus_ExplainsEveryDiscrepancy(t *testing.T) {
 	stampLedger(t, db, ctx, app, "1", "0001_from_backup.up.sql", ContentDigest("old"))
 	// A ledger row with no file behind it, and a pending migration.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256)
+		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256)
 		 VALUES ($1, 'postgres', '', '9', '0009_deleted.up.sql', 'deadbeef')`, app); err != nil {
 		t.Fatal(err)
 	}

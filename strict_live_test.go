@@ -159,7 +159,7 @@ func TestStrict_LegacyRowsAreNotMismatches(t *testing.T) {
 
 	// A v1.4.0-shaped row: key only, no identity columns.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name) VALUES ($1, 'postgres', '', '1')`, app); err != nil {
+		`INSERT INTO public.migrations (app, database, schema, sequence) VALUES ($1, 'postgres', '', '1')`, app); err != nil {
 		t.Fatalf("seed legacy row: %v", err)
 	}
 

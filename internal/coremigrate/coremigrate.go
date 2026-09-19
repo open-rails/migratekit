@@ -38,17 +38,37 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	// Fresh installs get the full shape (constraint auto-named
-	// migrations_app_database_schema_name_key).
+	// migrations_app_database_schema_sequence_key).
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS public.migrations (
 			id BIGSERIAL PRIMARY KEY,
 			app TEXT NOT NULL,
 			database TEXT NOT NULL,
-			name TEXT NOT NULL,
+			sequence TEXT NOT NULL,
 			schema TEXT NOT NULL DEFAULT '',
 			migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE(app, database, schema, name)
+			UNIQUE(app, database, schema, sequence)
 		);
+	`); err != nil {
+		return err
+	}
+	// Older tracker tables called this prefix key `name`. Keep existing
+	// ledgers usable while making the column's meaning explicit. The key stays
+	// TEXT because migration prefixes are normalized strings and existing rows
+	// must survive the rename unchanged.
+	if _, err := tx.ExecContext(ctx, `
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = 'migrations' AND column_name = 'name'
+			) AND NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = 'migrations' AND column_name = 'sequence'
+			) THEN
+				ALTER TABLE public.migrations RENAME COLUMN name TO sequence;
+			END IF;
+		END $$;
 	`); err != nil {
 		return err
 	}
@@ -57,14 +77,17 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS schema TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
-	// Widen the unique key from (app, database, name) to include schema.
+	// Widen the unique key from (app, database, sequence) to include schema.
 	// Idempotent: swap only if the old constraint is still present.
 	if _, err := tx.ExecContext(ctx, `
 		DO $$
 		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_name_key') THEN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_sequence_key') THEN
 				ALTER TABLE public.migrations
-					ADD CONSTRAINT migrations_app_database_schema_name_key UNIQUE (app, database, schema, name);
+					ADD CONSTRAINT migrations_app_database_schema_sequence_key UNIQUE (app, database, schema, sequence);
+			END IF;
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_name_key') THEN
+				ALTER TABLE public.migrations DROP CONSTRAINT migrations_app_database_schema_name_key;
 			END IF;
 			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_name_key') THEN
 				ALTER TABLE public.migrations DROP CONSTRAINT migrations_app_database_name_key;
@@ -73,7 +96,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	`); err != nil {
 		return err
 	}
-	// v1.5.0 migration identity. `name` holds only Prefix(filename) — the bare
+	// v1.5.0 migration identity. `sequence` holds only Prefix(filename) — the bare
 	// number — so the ledger cannot tell two DIFFERENT files that claimed the
 	// same number apart, and records the second as already applied. Storing the
 	// full filename and a content digest makes that detectable. Both are
@@ -109,7 +132,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 			app TEXT NOT NULL,
 			database TEXT NOT NULL,
 			schema TEXT NOT NULL DEFAULT '',
-			name TEXT NOT NULL,
+			sequence TEXT NOT NULL,
 			verb TEXT NOT NULL,
 			reason TEXT NOT NULL,
 			operator TEXT NOT NULL DEFAULT '',
@@ -125,6 +148,22 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 			ON public.migration_repairs (app, database, schema, repaired_at DESC);
 	`)
 	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = 'migration_repairs' AND column_name = 'name'
+			) AND NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				 WHERE table_schema = 'public' AND table_name = 'migration_repairs' AND column_name = 'sequence'
+			) THEN
+				ALTER TABLE public.migration_repairs RENAME COLUMN name TO sequence;
+			END IF;
+		END $$;
+	`); err != nil {
 		return err
 	}
 	return tx.Commit()
