@@ -290,6 +290,9 @@ func (s Status) Report() string {
 // whole point.
 func (p *Postgres) Status(ctx context.Context, migrations []Migration) (Status, error) {
 	st := Status{App: p.app, Schema: p.schema}
+	if err := ValidateSequences(migrations); err != nil {
+		return st, err
+	}
 
 	if err := p.ensureSetup(ctx); err != nil {
 		return st, err

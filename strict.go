@@ -55,20 +55,16 @@ const statusHint = "Run `migratekit status` for resolution guidance."
 
 // AppliedRecord is one row of the applied-migrations ledger.
 type AppliedRecord struct {
-	// Key is the ledger key — Prefix(filename).
+	// Key is the decimal display form of the BIGINT sequence.
 	Key string
-	// Filename is the full migration filename that claimed Key. Empty for
-	// rows written before v1.5.0.
+	// Filename is the full migration filename that claimed Key.
 	Filename string
-	// Digest is the sha256 of the applied migration's content. Empty for
-	// rows written before v1.5.0.
+	// Digest is the sha256 of the applied migration's content.
 	Digest string
 	// SemanticDigest hashes SQL tokens while ignoring comments and formatting.
-	// Empty for rows written before v1.8.0.
 	SemanticDigest string
-	// Status is the apply state: applied, running or failed. Empty for rows
-	// written before v1.7.0, which are applied by construction — only a
-	// no-transaction migration can be anything else.
+	// Status is applied, running, or failed. Only a no-transaction migration
+	// can remain running or failed.
 	Status string
 	// Error is the recorded cause of a failed no-transaction apply.
 	Error string
@@ -146,38 +142,6 @@ func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord
 		out[rec.Key] = rec
 	}
 	return out, rows.Err()
-}
-
-// backfillSemanticDigests upgrades an unchanged legacy ledger row. A raw
-// digest match proves we still have the bytes that ran, so recording their
-// token digest is safe and lets later comment/format edits compare cleanly.
-func (p *Postgres) backfillSemanticDigests(ctx context.Context, migrations []Migration,
-	applied map[string]AppliedRecord,
-) error {
-	for _, migration := range migrations {
-		key := Prefix(migration.Name)
-		record, ok := applied[key]
-		if !ok || record.Digest == "" || record.SemanticDigest != "" ||
-			record.Filename != "" && record.Filename != migration.Name ||
-			record.Digest != ContentDigest(migration.Content) {
-			continue
-		}
-		semantic := SemanticContentDigest(migration.Content)
-		sequence, err := strconv.ParseInt(record.Key, 10, 64)
-		if err != nil {
-			return fmt.Errorf("migratekit: invalid ledger sequence %q: %w", record.Key, err)
-		}
-		if _, err := p.db.ExecContext(ctx,
-			`UPDATE public.migrations SET semantic_sha256 = $1
-			  WHERE app = $2 AND database = $3 AND schema = $4 AND sequence = $5
-			    AND semantic_sha256 IS NULL`,
-			semantic, p.app, postgresDriver, p.schema, sequence); err != nil {
-			return err
-		}
-		record.SemanticDigest = semantic
-		applied[key] = record
-	}
-	return nil
 }
 
 // checkOptions selects which discrepancies analyze reports and how severe

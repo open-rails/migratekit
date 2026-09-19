@@ -247,6 +247,10 @@ func (p *Postgres) unlock(ctx context.Context) error {
 // ordering-exception audit row in the same transaction as the DDL, so the
 // deviation and the schema change are one atomic fact.
 func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairRequest) error {
+	sequence, err := Sequence(m.Name)
+	if err != nil {
+		return err
+	}
 	if hasNoTransactionDirective(m.Content) {
 		return p.applyOneNoTx(ctx, m, audit)
 	}
@@ -279,10 +283,6 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 		return err
 	}
 
-	sequence, err := Sequence(m.Name)
-	if err != nil {
-		return err
-	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -303,7 +303,7 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed).
-// Setup() always runs first under migratekit's bootstrap lock, so there is no
+// Tracker initialization runs first under migratekit's bootstrap lock, so there is no
 // missing-table special case or caller-owned setup retry loop.
 func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) error {
 	return p.applyMigrations(ctx, migrations, nil, nil)
@@ -312,6 +312,9 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 // applyMigrations is the shared apply path. allowBelow exempts ledger keys
 // from the ordering rule and audit, when non-nil, records the exception.
 func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, allowBelow map[string]bool, audit *RepairRequest) (err error) {
+	if err := ValidateSequences(migrations); err != nil {
+		return err
+	}
 	if err := p.ensureSetup(ctx); err != nil {
 		return err
 	}
@@ -325,9 +328,6 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	// again under it so a racing process cannot slip a claim in between.
 	records, err := p.AppliedRecords(ctx)
 	if err != nil {
-		return err
-	}
-	if err := p.backfillSemanticDigests(ctx, migrations, records); err != nil {
 		return err
 	}
 	discrepancies := analyze(migrations, records, opts)
@@ -359,9 +359,6 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	// Double-check under lock in case another process applied some since our first read
 	records, err = p.AppliedRecords(ctx)
 	if err != nil {
-		return err
-	}
-	if err := p.backfillSemanticDigests(ctx, migrations, records); err != nil {
 		return err
 	}
 	if err := firstError(analyze(migrations, records, opts)); err != nil {
@@ -406,6 +403,9 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 // This is intended for use during application startup to ensure the database
 // schema is up-to-date before the app starts serving requests.
 func (p *Postgres) ValidateAllApplied(ctx context.Context, migrations []Migration) error {
+	if err := ValidateSequences(migrations); err != nil {
+		return err
+	}
 	applied, err := p.Applied(ctx)
 	if err != nil {
 		// If the migrations table doesn't exist, no migrations have been applied
