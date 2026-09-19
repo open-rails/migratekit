@@ -147,7 +147,7 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 		return nil, fmt.Errorf("%w: SchemaVerified is not set. A baseline is a claim that the schema already matches the tree, "+
 			"and this package cannot check it. Verify the objects the migrations build, then say so", ErrBaselineUnsafe)
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return nil, err
 	}
 	// A preview reads without the lock: it is advisory, and a global migration
@@ -201,7 +201,7 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 
 	for _, record := range plan.Retire {
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM public.migrations WHERE app = $1 AND database = $2 AND schema = $3 AND name = $4`,
+			`DELETE FROM public.migrations WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
 			p.app, postgresDriver, p.schema, record.Key); err != nil {
 			return nil, err
 		}
@@ -212,7 +212,7 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 	for _, m := range plan.Record {
 		key, digest := Prefix(m.Name), ContentDigest(m.Content)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, semantic_sha256, status)
+			`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256, status)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 			p.app, postgresDriver, p.schema, key, m.Name, digest, SemanticContentDigest(m.Content), StatusApplied); err != nil {
 			return nil, err
