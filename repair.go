@@ -180,7 +180,7 @@ func (p *Postgres) RepairAdopt(ctx context.Context, m Migration, req RepairReque
 	if err := req.validate("repair adopt"); err != nil {
 		return RepairResult{}, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return RepairResult{}, err
 	}
 	applied, err := p.AppliedRecords(ctx)
@@ -207,7 +207,7 @@ func (p *Postgres) RepairAdoptAllUnmatched(ctx context.Context, migrations []Mig
 	if err := req.validate("repair adopt --all-unmatched"); err != nil {
 		return nil, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return nil, err
 	}
 	applied, err := p.AppliedRecords(ctx)
@@ -246,7 +246,7 @@ func (p *Postgres) RepairAcceptContent(ctx context.Context, m Migration, req Rep
 	if err := req.validate("repair accept-content"); err != nil {
 		return RepairResult{}, err
 	}
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return RepairResult{}, err
 	}
 	applied, err := p.AppliedRecords(ctx)
@@ -299,7 +299,7 @@ func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedReco
 
 	tag, err := tx.ExecContext(ctx,
 		`UPDATE public.migrations SET filename = $1, content_sha256 = $2, semantic_sha256 = $3
-		  WHERE app = $4 AND database = $5 AND schema = $6 AND name = $7`,
+		  WHERE app = $4 AND database = $5 AND schema = $6 AND sequence = $7`,
 		filename, digest, semantic, p.app, postgresDriver, p.schema, old.Key)
 	if err != nil {
 		return res, err
@@ -316,7 +316,7 @@ func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedReco
 func (p *Postgres) insertAudit(ctx context.Context, tx *sql.Tx, verb, key, oldFile, oldDigest, newFile, newDigest string, req RepairRequest) error {
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO public.migration_repairs
-		   (app, database, schema, name, verb, reason, operator, os_user, host,
+		   (app, database, schema, sequence, verb, reason, operator, os_user, host,
 		    old_filename, old_digest, new_filename, new_digest)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		p.app, postgresDriver, p.schema, key, verb, strings.TrimSpace(req.Reason),
@@ -334,11 +334,11 @@ func nullable(s string) any {
 
 // RepairHistory returns this app's repair audit trail, newest first.
 func (p *Postgres) RepairHistory(ctx context.Context) ([]RepairRecord, error) {
-	if err := p.Setup(ctx); err != nil {
+	if err := p.ensureSetup(ctx); err != nil {
 		return nil, err
 	}
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT id, name, verb, reason, COALESCE(operator,''), COALESCE(os_user,''), COALESCE(host,''),
+		`SELECT id, sequence, verb, reason, COALESCE(operator,''), COALESCE(os_user,''), COALESCE(host,''),
 		        COALESCE(old_filename,''), COALESCE(old_digest,''), COALESCE(new_filename,''), COALESCE(new_digest,''),
 		        repaired_at
 		   FROM public.migration_repairs
@@ -381,7 +381,7 @@ func (p *Postgres) ApplyWithOrderingException(ctx context.Context, migrations []
 		exempt[Prefix(a)] = true
 	}
 	if req.DryRun {
-		if err := p.Setup(ctx); err != nil {
+		if err := p.ensureSetup(ctx); err != nil {
 			return err
 		}
 		records, err := p.AppliedRecords(ctx)

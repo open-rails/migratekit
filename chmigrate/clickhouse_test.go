@@ -17,7 +17,13 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 	defer db.Close()
 
 	// Setup() must succeed without touching ClickHouse migration tables when PostgresDB is provided.
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock\\(\\$1\\)").
+		WithArgs(int64(7592348109)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("DO").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -29,6 +35,9 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migration_repairs").
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("DO").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
 
 	ch := New(&Config{
 		ClientAddr: "invalid:0",

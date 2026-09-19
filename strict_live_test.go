@@ -32,7 +32,7 @@ func strictTestDB(t *testing.T, app string) (*sql.DB, context.Context) {
 		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS `+app+`_b`)
 	}
 	m := NewPostgres(db, app)
-	if err := m.Setup(ctx); err != nil {
+	if err := m.ensureSetup(ctx); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	clean()
@@ -159,7 +159,7 @@ func TestStrict_LegacyRowsAreNotMismatches(t *testing.T) {
 
 	// A v1.4.0-shaped row: key only, no identity columns.
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name) VALUES ($1, 'postgres', '', '1')`, app); err != nil {
+		`INSERT INTO public.migrations (app, database, schema, sequence) VALUES ($1, 'postgres', '', '1')`, app); err != nil {
 		t.Fatalf("seed legacy row: %v", err)
 	}
 

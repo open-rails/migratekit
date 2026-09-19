@@ -69,6 +69,18 @@ func TestAnalyze_RunningRowIsAlsoAnError(t *testing.T) {
 	}
 }
 
+func TestAnalyze_DirtyOrphanStillBlocksApply(t *testing.T) {
+	// The migration file can disappear after a failed deploy. It is still a
+	// partial apply and must not be downgraded to an informational orphan.
+	applied := map[string]AppliedRecord{
+		"2": {Key: "2", Filename: "0002_index.up.sql", Status: StatusRunning},
+	}
+	ds := analyze([]Migration{{Name: "0003_next.up.sql", Content: "SELECT 1;"}}, applied, checkOptions{})
+	if len(ds) != 1 || ds[0].Kind != KindDirtyMigration || ds[0].Severity != SeverityError {
+		t.Fatalf("a dirty orphan must block the apply, got %+v", ds)
+	}
+}
+
 // A legacy row (no status recorded) is applied, not dirty.
 func TestAnalyze_EmptyStatusIsApplied(t *testing.T) {
 	migs := []Migration{{Name: "0001_a.up.sql", Content: "SELECT 1;"}}

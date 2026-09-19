@@ -9,20 +9,20 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/open-rails/migratekit/internal/coremigrate"
-)
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 
-const (
-	// globalMigrationLockKey is the advisory lock key used for all migrations
-	// across all apps. This ensures only one migration process runs at a time,
-	// preventing race conditions when multiple services start simultaneously.
-	globalMigrationLockKey = 7592348109 // Arbitrary constant
+	"github.com/open-rails/migratekit/internal/coremigrate"
 )
 
 // Postgres handles PostgreSQL migrations
 type Postgres struct {
 	db  *sql.DB
 	app string
+	// ownedDB is non-nil only for Postgres values created by
+	// NewPostgresFromPGXPool. NewPostgres never owns its *sql.DB and therefore
+	// Close is a no-op for values created through that constructor.
+	ownedDB *sql.DB
 
 	// schema optionally sets a schema-qualified search_path for executing
 	// migrations, similar to River's `rivermigrate.Config.Schema`.
@@ -56,6 +56,49 @@ type Postgres struct {
 // NewPostgres creates a Postgres migrator
 func NewPostgres(db *sql.DB, app string) *Postgres {
 	return &Postgres{db: db, app: app}
+}
+
+// NewPostgresFromPGXPool creates a migration handle from a host pgx pool
+// without using or mutating that pool. Migrations use connection-local session
+// state (search_path, lock_timeout, statement_timeout) and pin one connection
+// for the advisory lock while applying on another, so sharing the host pool
+// could leak migration state into ordinary application queries.
+//
+// The returned Postgres owns a separate *sql.DB. Call Close when the migration
+// or validation operation is complete. The pool's connection configuration is
+// copied; BeforeConnect and AfterConnect are preserved, while the host pool's
+// acquisition/release lifecycle is not involved.
+func NewPostgresFromPGXPool(pool *pgxpool.Pool, app string) (*Postgres, error) {
+	if pool == nil {
+		return nil, fmt.Errorf("migratekit: a non-nil *pgxpool.Pool is required")
+	}
+	cfg := pool.Config()
+	if cfg == nil || cfg.ConnConfig == nil {
+		return nil, fmt.Errorf("migratekit: pgx pool has no connection configuration")
+	}
+
+	var opts []stdlib.OptionOpenDB
+	if cfg.BeforeConnect != nil {
+		opts = append(opts, stdlib.OptionBeforeConnect(cfg.BeforeConnect))
+	}
+	if cfg.AfterConnect != nil {
+		opts = append(opts, stdlib.OptionAfterConnect(cfg.AfterConnect))
+	}
+	db := stdlib.OpenDB(*cfg.ConnConfig.Copy(), opts...)
+	// migrate() pins one connection for the advisory lock and applies on a
+	// second connection. Keep the owned adapter bounded to that requirement.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
+	return &Postgres{db: db, app: app, ownedDB: db}, nil
+}
+
+// Close releases the dedicated database handle owned by
+// NewPostgresFromPGXPool. It never closes a *sql.DB supplied to NewPostgres.
+func (p *Postgres) Close() error {
+	if p == nil || p.ownedDB == nil {
+		return nil
+	}
+	return p.ownedDB.Close()
 }
 
 // WithSchema configures the schema to target for migrations.
@@ -115,7 +158,7 @@ func rewriteSchemaRefs(sqlText, target string, from []string) (string, error) {
 }
 
 // Setup ensures migration tables exist (idempotent)
-func (p *Postgres) Setup(ctx context.Context) error {
+func (p *Postgres) ensureSetup(ctx context.Context) error {
 	return coremigrate.EnsurePublicMigrationsTable(ctx, p.db)
 }
 
@@ -127,10 +170,10 @@ func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
 	rows, err := p.db.QueryContext(ctx,
 		// COALESCE(status,'applied'): a row that is still running, or that
 		// failed half-applied, is NOT proof of application — see notx.go.
-		`SELECT name FROM public.migrations
+		`SELECT sequence FROM public.migrations
 		  WHERE app = $1 AND database = $2 AND schema = $3
 		    AND COALESCE(status, 'applied') = 'applied'
-		  ORDER BY name`,
+		  ORDER BY sequence`,
 		p.app, postgresDriver, p.schema)
 	if err != nil {
 		return nil, err
@@ -162,7 +205,7 @@ func (p *Postgres) lock(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("acquire connection for migration advisory lock: %w", err)
 	}
-	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, int64(globalMigrationLockKey)); err != nil {
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, coremigrate.MigrationSetupLockKey); err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("acquire global migration advisory lock: %w", err)
 	}
@@ -184,7 +227,7 @@ func (p *Postgres) unlock(ctx context.Context) error {
 
 	var unlocked bool
 	err := p.lockConn.QueryRowContext(ctx,
-		`SELECT pg_advisory_unlock($1)`, int64(globalMigrationLockKey)).Scan(&unlocked)
+		`SELECT pg_advisory_unlock($1)`, coremigrate.MigrationSetupLockKey).Scan(&unlocked)
 	closeErr := p.lockConn.Close() // releases the session lock even on unlock failure
 	p.lockConn = nil
 
@@ -235,13 +278,13 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 		return err
 	}
 
-	// `name` stays Prefix(m.Name) — it is the ledger key every existing
+	// `sequence` stores Prefix(m.Name) — it is the ledger key every existing
 	// database is written with. filename/content_sha256 carry the identity
 	// that key cannot express (see verifyIdentity).
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, schema, name, filename, content_sha256, semantic_sha256)
+		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 ON CONFLICT (app, database, schema, name) DO NOTHING`,
+		 ON CONFLICT (app, database, schema, sequence) DO NOTHING`,
 		p.app, postgresDriver, p.schema, Prefix(m.Name), m.Name,
 		ContentDigest(m.Content), SemanticContentDigest(m.Content)); err != nil {
 		return err
@@ -258,7 +301,8 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed).
-// Setup() always runs first, so there is no missing-table special case.
+// Setup() always runs first under migratekit's bootstrap lock, so there is no
+// missing-table special case or caller-owned setup retry loop.
 func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) error {
 	return p.applyMigrations(ctx, migrations, nil, nil)
 }
@@ -266,14 +310,8 @@ func (p *Postgres) ApplyMigrations(ctx context.Context, migrations []Migration) 
 // applyMigrations is the shared apply path. allowBelow exempts ledger keys
 // from the ordering rule and audit, when non-nil, records the exception.
 func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, allowBelow map[string]bool, audit *RepairRequest) (err error) {
-	// CREATE TABLE IF NOT EXISTS is cheap and almost always a no-op. Two
-	// replicas racing the very first Setup can hit Postgres's known
-	// concurrent-create race (duplicate key on pg_type/pg_class); one retry
-	// resolves it because the loser then sees the winner's table.
-	if err := p.Setup(ctx); err != nil {
-		if err = p.Setup(ctx); err != nil {
-			return err
-		}
+	if err := p.ensureSetup(ctx); err != nil {
+		return err
 	}
 
 	opts := checkOptions{
