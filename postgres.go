@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -182,11 +183,11 @@ func (p *Postgres) Applied(ctx context.Context) ([]string, error) {
 
 	var names []string
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var sequence int64
+		if err := rows.Scan(&sequence); err != nil {
 			return nil, err
 		}
-		names = append(names, name)
+		names = append(names, strconv.FormatInt(sequence, 10))
 	}
 	return names, rows.Err()
 }
@@ -278,20 +279,21 @@ func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairReque
 		return err
 	}
 
-	// `sequence` stores Prefix(m.Name) — it is the ledger key every existing
-	// database is written with. filename/content_sha256 carry the identity
-	// that key cannot express (see verifyIdentity).
+	sequence, err := Sequence(m.Name)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (app, database, schema, sequence) DO NOTHING`,
-		p.app, postgresDriver, p.schema, Prefix(m.Name), m.Name,
+		p.app, postgresDriver, p.schema, sequence, m.Name,
 		ContentDigest(m.Content), SemanticContentDigest(m.Content)); err != nil {
 		return err
 	}
 
 	if audit != nil {
-		if err := p.insertAudit(ctx, tx, "apply --allow-below-applied", Prefix(m.Name),
+		if err := p.insertAudit(ctx, tx, "apply --allow-below-applied", strconv.FormatInt(sequence, 10),
 			"", "", m.Name, ContentDigest(m.Content), *audit); err != nil {
 			return err
 		}

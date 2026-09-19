@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -136,10 +137,12 @@ func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord
 
 	out := map[string]AppliedRecord{}
 	for rows.Next() {
+		var sequence int64
 		var rec AppliedRecord
-		if err := rows.Scan(&rec.Key, &rec.Filename, &rec.Digest, &rec.SemanticDigest, &rec.Status, &rec.Error); err != nil {
+		if err := rows.Scan(&sequence, &rec.Filename, &rec.Digest, &rec.SemanticDigest, &rec.Status, &rec.Error); err != nil {
 			return nil, err
 		}
+		rec.Key = strconv.FormatInt(sequence, 10)
 		out[rec.Key] = rec
 	}
 	return out, rows.Err()
@@ -160,11 +163,15 @@ func (p *Postgres) backfillSemanticDigests(ctx context.Context, migrations []Mig
 			continue
 		}
 		semantic := SemanticContentDigest(migration.Content)
+		sequence, err := strconv.ParseInt(record.Key, 10, 64)
+		if err != nil {
+			return fmt.Errorf("migratekit: invalid ledger sequence %q: %w", record.Key, err)
+		}
 		if _, err := p.db.ExecContext(ctx,
 			`UPDATE public.migrations SET semantic_sha256 = $1
 			  WHERE app = $2 AND database = $3 AND schema = $4 AND sequence = $5
 			    AND semantic_sha256 IS NULL`,
-			semantic, p.app, postgresDriver, p.schema, key); err != nil {
+			semantic, p.app, postgresDriver, p.schema, sequence); err != nil {
 			return err
 		}
 		record.SemanticDigest = semantic

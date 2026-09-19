@@ -200,9 +200,13 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 	defer tx.Rollback()
 
 	for _, record := range plan.Retire {
+		sequence, err := strconv.ParseInt(record.Key, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("migratekit: invalid ledger sequence %q: %w", record.Key, err)
+		}
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM public.migrations WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
-			p.app, postgresDriver, p.schema, record.Key); err != nil {
+			p.app, postgresDriver, p.schema, sequence); err != nil {
 			return nil, err
 		}
 		if err := p.insertAudit(ctx, tx, verb, record.Key, record.Filename, record.Digest, "", "", req.RepairRequest); err != nil {
@@ -211,10 +215,14 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 	}
 	for _, m := range plan.Record {
 		key, digest := Prefix(m.Name), ContentDigest(m.Content)
+		sequence, err := Sequence(m.Name)
+		if err != nil {
+			return nil, err
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256, status)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			p.app, postgresDriver, p.schema, key, m.Name, digest, SemanticContentDigest(m.Content), StatusApplied); err != nil {
+			p.app, postgresDriver, p.schema, sequence, m.Name, digest, SemanticContentDigest(m.Content), StatusApplied); err != nil {
 			return nil, err
 		}
 		if err := p.insertAudit(ctx, tx, verb, key, "", "", m.Name, digest, req.RepairRequest); err != nil {

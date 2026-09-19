@@ -49,6 +49,16 @@ func TestPrefix(t *testing.T) {
 	}
 }
 
+func TestSequence(t *testing.T) {
+	got, err := Sequence("0001_schema.up.sql")
+	if err != nil || got != 1 {
+		t.Fatalf("Sequence = %d, %v; want 1", got, err)
+	}
+	if _, err := Sequence("schema.up.sql"); err == nil {
+		t.Fatal("Sequence should reject a non-numeric migration prefix")
+	}
+}
+
 func TestRewriteSchemaRefs(t *testing.T) {
 	in := strings.Join([]string{
 		"CREATE SCHEMA IF NOT EXISTS openrails;",

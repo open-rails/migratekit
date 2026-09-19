@@ -20,10 +20,6 @@ func TestEnsurePublicMigrationsTableRollsBackSetup(t *testing.T) {
 		WithArgs(MigrationSetupLockKey).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("DO").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
 		WillReturnError(errors.New("injected setup failure"))
 	mock.ExpectRollback()
 
@@ -52,20 +48,6 @@ func TestTracker_Basics(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("DO").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("ALTER TABLE public\\.migrations ADD COLUMN IF NOT EXISTS schema").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("migrations_app_database_schema_name_key").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("ADD COLUMN IF NOT EXISTS filename").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("ADD COLUMN IF NOT EXISTS status").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migration_repairs").
-		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("DO").
-		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 	if err := tr.Setup(ctx); err != nil {
 		t.Fatalf("Setup: %v", err)
@@ -73,7 +55,7 @@ func TestTracker_Basics(t *testing.T) {
 
 	mock.ExpectQuery("SELECT sequence FROM public\\.migrations").
 		WithArgs("doujins", "clickhouse").
-		WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow("1").AddRow("2"))
+		WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(int64(1)).AddRow(int64(2)))
 	applied, err := tr.Applied(ctx, "doujins", "clickhouse")
 	if err != nil {
 		t.Fatalf("Applied: %v", err)
@@ -83,7 +65,7 @@ func TestTracker_Basics(t *testing.T) {
 	}
 
 	mock.ExpectExec("INSERT INTO public\\.migrations").
-		WithArgs("doujins", "clickhouse", "3").
+		WithArgs("doujins", "clickhouse", int64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := tr.RecordApplied(ctx, "doujins", "clickhouse", "3"); err != nil {
 		t.Fatalf("RecordApplied: %v", err)
