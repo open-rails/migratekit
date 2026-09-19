@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strconv"
 	"sync"
 )
 
@@ -48,11 +49,11 @@ func (t *Tracker) Applied(ctx context.Context, app string, database string) ([]s
 
 	var names []string
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var sequence int64
+		if err := rows.Scan(&sequence); err != nil {
 			return nil, err
 		}
-		names = append(names, name)
+		names = append(names, strconv.FormatInt(sequence, 10))
 	}
 	return names, rows.Err()
 }
@@ -61,9 +62,13 @@ func (t *Tracker) RecordApplied(ctx context.Context, app string, database string
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
-	_, err := t.db.ExecContext(ctx,
+	n, err := strconv.ParseInt(sequence, 10, 64)
+	if err != nil {
+		return fmt.Errorf("postgres tracker: invalid migration sequence %q: %w", sequence, err)
+	}
+	_, err = t.db.ExecContext(ctx,
 		`INSERT INTO public.migrations (app, database, sequence) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-		app, database, sequence,
+		app, database, n,
 	)
 	return err
 }

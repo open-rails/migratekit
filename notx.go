@@ -86,6 +86,10 @@ func (r AppliedRecord) isDirty() bool {
 // which is exactly what the directive exists to avoid.
 func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairRequest) error {
 	key := Prefix(m.Name)
+	sequence, err := Sequence(m.Name)
+	if err != nil {
+		return err
+	}
 	digest := ContentDigest(m.Content)
 	semantic := SemanticContentDigest(m.Content)
 
@@ -112,7 +116,7 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (app, database, schema, sequence)
 		 DO UPDATE SET status = EXCLUDED.status, filename = EXCLUDED.filename, "error" = NULL`,
-		p.app, postgresDriver, p.schema, key, m.Name, digest, semantic, StatusRunning); err != nil {
+		p.app, postgresDriver, p.schema, sequence, m.Name, digest, semantic, StatusRunning); err != nil {
 		return fmt.Errorf("claim %s: %w", m.Name, err)
 	}
 
@@ -121,7 +125,7 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 		_, updErr := p.db.ExecContext(ctx,
 			`UPDATE public.migrations SET status = $5, "error" = $6
 			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
-			p.app, postgresDriver, p.schema, key, StatusFailed, execErr.Error())
+			p.app, postgresDriver, p.schema, sequence, StatusFailed, execErr.Error())
 		return errors.Join(fmt.Errorf(
 			"migration %s failed OUTSIDE a transaction and may be PARTIALLY applied: %w\n"+
 				"  It is recorded %s in the ledger and boot will refuse until an operator resolves it. %s",
@@ -136,7 +140,7 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE public.migrations SET status = $5, "error" = NULL, content_sha256 = $6, semantic_sha256 = $7
 		  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
-		p.app, postgresDriver, p.schema, key, StatusApplied, digest, semantic); err != nil {
+		p.app, postgresDriver, p.schema, sequence, StatusApplied, digest, semantic); err != nil {
 		return err
 	}
 	if audit != nil {
@@ -210,6 +214,10 @@ func (p *Postgres) RepairResolve(ctx context.Context, m Migration, mode ResolveM
 		return RepairResult{}, err
 	}
 	key := Prefix(m.Name)
+	sequence, err := Sequence(m.Name)
+	if err != nil {
+		return RepairResult{}, err
+	}
 	rec, ok := applied[key]
 	if !ok {
 		return RepairResult{}, fmt.Errorf("%w: key %q is not in the ledger — a migration that never started has nothing to resolve", ErrNothingToRepair, key)
@@ -242,12 +250,12 @@ func (p *Postgres) RepairResolve(ctx context.Context, m Migration, mode ResolveM
 		_, err = tx.ExecContext(ctx,
 			`UPDATE public.migrations SET status = $5, "error" = NULL, filename = $6, content_sha256 = $7, semantic_sha256 = $8
 			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
-			p.app, postgresDriver, p.schema, key, StatusApplied, m.Name, digest, semantic)
+			p.app, postgresDriver, p.schema, sequence, StatusApplied, m.Name, digest, semantic)
 	} else {
 		_, err = tx.ExecContext(ctx,
 			`DELETE FROM public.migrations
 			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
-			p.app, postgresDriver, p.schema, key)
+			p.app, postgresDriver, p.schema, sequence)
 	}
 	if err != nil {
 		return RepairResult{}, err

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"strconv"
 	"strings"
 )
 
@@ -53,6 +54,17 @@ func Prefix(name string) string {
 		return "0"
 	}
 	return normalized
+}
+
+// Sequence returns the numeric migration sequence encoded by name. Migration
+// filenames are required to carry an int64 prefix; the ledger stores that
+// value as BIGINT rather than as a string.
+func Sequence(name string) (int64, error) {
+	sequence, err := strconv.ParseInt(Prefix(name), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("migration %q has invalid numeric sequence %q: %w", name, Prefix(name), err)
+	}
+	return sequence, nil
 }
 
 // isUndefinedTable reports whether err is Postgres SQLSTATE 42P01

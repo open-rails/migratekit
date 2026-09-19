@@ -18,8 +18,9 @@ import (
 // not exist yet.
 const MigrationSetupLockKey int64 = 7592348109
 
-// EnsurePublicMigrationsTable atomically creates/upgrades the tracker tables
-// under the shared bootstrap advisory lock. The tracker
+// EnsurePublicMigrationsTable atomically creates the tracker tables under the
+// shared bootstrap advisory lock. This is a destructive v2 schema: callers
+// must start with a fresh migration database. The tracker
 // identity includes `schema` because WithSchema places tables in different
 // schemas of the SAME database: without it, the same app applied to two schemas
 // (e.g. doujins.* and hentai0.* sharing one DB) would record under one identity
@@ -37,102 +38,28 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, MigrationSetupLockKey); err != nil {
 		return err
 	}
-	// Fresh installs get the full shape (constraint auto-named
-	// migrations_app_database_schema_sequence_key).
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS public.migrations (
 			id BIGSERIAL PRIMARY KEY,
 			app TEXT NOT NULL,
 			database TEXT NOT NULL,
-			sequence TEXT NOT NULL,
+			sequence BIGINT NOT NULL,
 			schema TEXT NOT NULL DEFAULT '',
+			filename TEXT,
+			content_sha256 TEXT,
+			semantic_sha256 TEXT,
+			status TEXT NOT NULL DEFAULT 'applied',
+			"error" TEXT,
 			migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			UNIQUE(app, database, schema, sequence)
 		);
-	`); err != nil {
-		return err
-	}
-	// Older tracker tables called this prefix key `name`. Keep existing
-	// ledgers usable while making the column's meaning explicit. The key stays
-	// TEXT because migration prefixes are normalized strings and existing rows
-	// must survive the rename unchanged.
-	if _, err := tx.ExecContext(ctx, `
-		DO $$
-		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				 WHERE table_schema = 'public' AND table_name = 'migrations' AND column_name = 'name'
-			) AND NOT EXISTS (
-				SELECT 1 FROM information_schema.columns
-				 WHERE table_schema = 'public' AND table_name = 'migrations' AND column_name = 'sequence'
-			) THEN
-				ALTER TABLE public.migrations RENAME COLUMN name TO sequence;
-			END IF;
-		END $$;
-	`); err != nil {
-		return err
-	}
-	// Upgrade path for tables created before the schema column existed.
-	if _, err := tx.ExecContext(ctx,
-		`ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS schema TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	// Widen the unique key from (app, database, sequence) to include schema.
-	// Idempotent: swap only if the old constraint is still present.
-	if _, err := tx.ExecContext(ctx, `
-		DO $$
-		BEGIN
-			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_sequence_key') THEN
-				ALTER TABLE public.migrations
-					ADD CONSTRAINT migrations_app_database_schema_sequence_key UNIQUE (app, database, schema, sequence);
-			END IF;
-			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_schema_name_key') THEN
-				ALTER TABLE public.migrations DROP CONSTRAINT migrations_app_database_schema_name_key;
-			END IF;
-			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'migrations_app_database_name_key') THEN
-				ALTER TABLE public.migrations DROP CONSTRAINT migrations_app_database_name_key;
-			END IF;
-		END $$;
-	`); err != nil {
-		return err
-	}
-	// v1.5.0 migration identity. `sequence` holds only Prefix(filename) — the bare
-	// number — so the ledger cannot tell two DIFFERENT files that claimed the
-	// same number apart, and records the second as already applied. Storing the
-	// full filename and a content digest makes that detectable. Both are
-	// nullable: rows written by <=v1.4.0 have no identity to check, and a NULL
-	// is treated as "unknown", never as a mismatch.
-	if _, err := tx.ExecContext(ctx, `
-		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS filename TEXT;
-		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS content_sha256 TEXT;
-		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS semantic_sha256 TEXT;
-	`); err != nil {
-		return err
-	}
-	// v1.7.0 no-transaction migrations. A migration that runs outside a
-	// transaction can fail HALF-APPLIED, so the ledger has to be able to hold
-	// an unfinished state instead of only "row present = done". DEFAULT
-	// 'applied' means every existing row, and every transactional insert, is
-	// complete by construction — nothing to backfill, and the transactional
-	// path stays one atomic insert.
-	if _, err := tx.ExecContext(ctx, `
-		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'applied';
-		ALTER TABLE public.migrations ADD COLUMN IF NOT EXISTS "error" TEXT;
-	`); err != nil {
-		return err
-	}
-	// v1.6.0 repair audit. Operators can rewrite the identity columns above
-	// with `migratekit repair`, which is the point — the checks are worth
-	// nothing if the only way past them is a hand-written UPDATE. What makes
-	// that safe is that every repair lands here in the same transaction: a
-	// repaired ledger is visible history, not an erased one.
-	_, err = tx.ExecContext(ctx, `
+
 		CREATE TABLE IF NOT EXISTS public.migration_repairs (
 			id BIGSERIAL PRIMARY KEY,
 			app TEXT NOT NULL,
 			database TEXT NOT NULL,
 			schema TEXT NOT NULL DEFAULT '',
-			sequence TEXT NOT NULL,
+			sequence BIGINT NOT NULL,
 			verb TEXT NOT NULL,
 			reason TEXT NOT NULL,
 			operator TEXT NOT NULL DEFAULT '',
@@ -146,23 +73,6 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 		);
 		CREATE INDEX IF NOT EXISTS migration_repairs_scope_idx
 			ON public.migration_repairs (app, database, schema, repaired_at DESC);
-	`)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		DO $$
-		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				 WHERE table_schema = 'public' AND table_name = 'migration_repairs' AND column_name = 'name'
-			) AND NOT EXISTS (
-				SELECT 1 FROM information_schema.columns
-				 WHERE table_schema = 'public' AND table_name = 'migration_repairs' AND column_name = 'sequence'
-			) THEN
-				ALTER TABLE public.migration_repairs RENAME COLUMN name TO sequence;
-			END IF;
-		END $$;
 	`); err != nil {
 		return err
 	}

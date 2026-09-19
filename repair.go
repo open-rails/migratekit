@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -296,11 +297,15 @@ func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedReco
 		return res, err
 	}
 	defer tx.Rollback()
+	sequence, err := strconv.ParseInt(old.Key, 10, 64)
+	if err != nil {
+		return res, fmt.Errorf("migratekit: invalid ledger sequence %q: %w", old.Key, err)
+	}
 
 	tag, err := tx.ExecContext(ctx,
 		`UPDATE public.migrations SET filename = $1, content_sha256 = $2, semantic_sha256 = $3
 		  WHERE app = $4 AND database = $5 AND schema = $6 AND sequence = $7`,
-		filename, digest, semantic, p.app, postgresDriver, p.schema, old.Key)
+		filename, digest, semantic, p.app, postgresDriver, p.schema, sequence)
 	if err != nil {
 		return res, err
 	}
@@ -314,12 +319,16 @@ func (p *Postgres) writeRepair(ctx context.Context, verb string, old AppliedReco
 }
 
 func (p *Postgres) insertAudit(ctx context.Context, tx *sql.Tx, verb, key, oldFile, oldDigest, newFile, newDigest string, req RepairRequest) error {
-	_, err := tx.ExecContext(ctx,
+	sequence, err := strconv.ParseInt(key, 10, 64)
+	if err != nil {
+		return fmt.Errorf("migratekit: invalid ledger sequence %q: %w", key, err)
+	}
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO public.migration_repairs
 		   (app, database, schema, sequence, verb, reason, operator, os_user, host,
 		    old_filename, old_digest, new_filename, new_digest)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-		p.app, postgresDriver, p.schema, key, verb, strings.TrimSpace(req.Reason),
+		p.app, postgresDriver, p.schema, sequence, verb, strings.TrimSpace(req.Reason),
 		req.Operator, osUser(), hostname(),
 		nullable(oldFile), nullable(oldDigest), nullable(newFile), nullable(newDigest))
 	return err
@@ -352,11 +361,13 @@ func (p *Postgres) RepairHistory(ctx context.Context) ([]RepairRecord, error) {
 
 	var out []RepairRecord
 	for rows.Next() {
+		var sequence int64
 		r := RepairRecord{App: p.app, Schema: p.schema}
-		if err := rows.Scan(&r.ID, &r.Key, &r.Verb, &r.Reason, &r.Operator, &r.OSUser, &r.Host,
+		if err := rows.Scan(&r.ID, &sequence, &r.Verb, &r.Reason, &r.Operator, &r.OSUser, &r.Host,
 			&r.OldFilename, &r.OldDigest, &r.NewFilename, &r.NewDigest, &r.At); err != nil {
 			return nil, err
 		}
+		r.Key = strconv.FormatInt(sequence, 10)
 		out = append(out, r)
 	}
 	return out, rows.Err()

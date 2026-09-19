@@ -181,7 +181,7 @@ is an implementation detail and may change in any release.
 | `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
 | `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration. **Since v1.7.0 it hashes the CANONICAL BODY** — the file with its own `-- parent:` header removed — so adding a parent line to an applied migration changes no ledger digest. A headerless file hashes exactly as it did in v1.5.0. |
 | `SemanticContentDigest(content string) string` | *(v1.8.0)* Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
-| `type AppliedRecord struct { Key, Filename, Digest, SemanticDigest, Status, Error string }` | One ledger row. `SemanticDigest` is empty for rows written before v1.8.0 and is backfilled when the legacy raw digest still matches. |
+| `type AppliedRecord struct { Key, Filename, Digest, SemanticDigest, Status, Error string }` | One current ledger row. `Key` is the decimal representation of the BIGINT `sequence` column. |
 | `Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error)` | *(v1.7.0)* `LoadFromFS` plus options. `RequireParentLinks()` makes a headerless migration an error; `WithChainWarnFunc(fn)` redirects the tolerance warnings. |
 | `VerifyChain(migrations []Migration, opts ...LoadOption) error` | *(v1.7.0)* The parent-link check on an already-loaded chain. |
 | `CheckChainFS(fsys fs.FS, dir string, requireLinks bool) error` | *(v1.7.0)* The CI gate: `CheckChain`'s numbering rules plus parent-link validation, which needs the bytes and not just the names. |
@@ -202,7 +202,7 @@ is an implementation detail and may change in any release.
 | `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |
 | `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | *(v1.6.0)* Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
-| `(*Postgres) Status(ctx, []Migration) (Status, error)` | *(v1.6.0)* Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Read-only apart from `Setup`. |
+| `(*Postgres) Status(ctx, []Migration) (Status, error)` | Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Tracker tables are initialized automatically by mutating operations. |
 | `(*Postgres) RepairAdopt(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Bind the file in the tree as the applied identity for its number. For a ledger that is the stale side. |
 | `(*Postgres) RepairAdoptAllUnmatched(ctx, []Migration, RepairRequest) ([]RepairResult, error)` | *(v1.6.0)* The same for every mismatched row at once — the restored-backup shape. |
 | `(*Postgres) RepairAcceptContent(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Re-stamp the digest after a verified edit; clears the drift warning. Refuses on an identity mismatch. |
@@ -266,9 +266,9 @@ on every apply:
   both files and demanding a renumber.
 - **Integrity** — a migration edited after it ran is a hard error.
 
-Both are always on and cannot fire spuriously: rows written by ≤v1.4.0 carry no
-identity, and unknown reads as unknown, never as a mismatch. The two new columns
-are added by `Setup()`; no consumer action is required.
+Both are always on. The v2 ledger is a fresh database contract; there are no
+legacy rows to interpret and no compatibility upgrade path. Tracker tables are
+created automatically when an operation needs them.
 
 - **Ordering** — `WithStrictOrdering()` additionally refuses a pending migration
   that sorts below one already applied. Opt-in, because existing chains
@@ -432,7 +432,9 @@ enough to drop `clickhouse-go`/`ch-go` from `go.mod`/`go.sum`.
 
 ## Schema
 
-migratekit creates two tables in the `public` schema on first `Setup()`:
+migratekit creates two tables in the `public` schema automatically on the first
+operation that needs tracking. This is a destructive v2 schema: reset existing
+tracker tables when adopting this release.
 
 ```sql
 CREATE TABLE public.migrations (
@@ -440,12 +442,12 @@ CREATE TABLE public.migrations (
     app TEXT NOT NULL,
     database TEXT NOT NULL,
     schema TEXT NOT NULL DEFAULT '',
-    sequence TEXT NOT NULL,         -- the ledger KEY: Prefix(filename)
-    filename TEXT,                  -- v1.5.0 identity; NULL on older rows
-    content_sha256 TEXT,            -- v1.5.0 integrity; NULL on older rows
-    semantic_sha256 TEXT,           -- v1.8.0 token digest; NULL until upgraded
-    status TEXT NOT NULL DEFAULT 'applied',  -- v1.7.0: applied | running | failed
-    "error" TEXT,                   -- v1.7.0: why a no-transaction apply failed
+    sequence BIGINT NOT NULL,       -- the numeric ledger key: Prefix(filename)
+    filename TEXT,
+    content_sha256 TEXT,
+    semantic_sha256 TEXT,
+    status TEXT NOT NULL DEFAULT 'applied',  -- applied | running | failed
+    "error" TEXT,                   -- why a no-transaction apply failed
     migrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(app, database, schema, sequence)
 );
@@ -458,7 +460,7 @@ CREATE TABLE public.migration_repairs (
     app TEXT NOT NULL,
     database TEXT NOT NULL,
     schema TEXT NOT NULL DEFAULT '',
-    sequence TEXT NOT NULL,         -- the ledger key repaired
+    sequence BIGINT NOT NULL,       -- the numeric ledger key repaired
     verb TEXT NOT NULL,
     reason TEXT NOT NULL,
     operator TEXT NOT NULL DEFAULT '',
