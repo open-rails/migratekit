@@ -45,10 +45,6 @@ import (
 // late arrivals that predate the rule; a consumer adopts it when its chain is
 // clean.
 //
-// None of the checks can fire on a legacy ledger: rows written by <=v1.4.0
-// carry no filename or digest, and an unknown identity is treated as unknown,
-// never as a mismatch.
-
 // statusHint is appended to every refusal. A boot error that names a problem
 // and stops is a headache; one that names the verb that resolves it is not.
 const statusHint = "Run `migratekit status` for resolution guidance."

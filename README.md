@@ -115,9 +115,12 @@ refusal — but only if there is a way out of it that is not `psql` and a hand-w
 `UPDATE public.migrations`. Since v1.6.0 there is:
 
 ```bash
-go run github.com/open-rails/migratekit/cmd/migratekit@latest status \
+go run github.com/open-rails/migratekit/cmd/migratekit status \
   -app tensorhub -dir migrations/postgres -dsn "$DATABASE_URL"
 ```
+
+Run the command within the application module to use its pinned migratekit
+version.
 
 `status` prints, for every discrepancy, WHAT is wrong (file, number, both digests), the
 LIKELY CAUSES, and the command that resolves each one. Every boot refusal ends by
@@ -198,7 +201,7 @@ is an implementation detail and may change in any release.
 | `NewPostgresFromPGXPool(pool *pgxpool.Pool, app string) (*Postgres, error)` | Creates an isolated, two-connection migration handle from a host pgx pool. The returned migrator owns that handle; call `Close` when done. The host pool is never used or mutated. |
 | `(*Postgres) Close() error` | Closes the isolated database handle created by `NewPostgresFromPGXPool`; no-op for `NewPostgres` values. |
 | `(*Postgres) WithSchema(schema string, rewriteFrom ...string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Optional `rewriteFrom` canonical schema names are rewritten to `schema` in migration SQL before execution, for portable hard-qualified app DDL such as `openrails.foo`. Tracking stays in `public.migrations`. |
-| `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: atomically initializes/upgrades the tracking tables under the global bootstrap lock, then applies every unapplied migration in order under the migration advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
+| `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: atomically initializes the tracking tables under the global bootstrap lock, then applies every unapplied migration in order under the migration advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
 | `(*Postgres) Applied(ctx) ([]string, error)` | Recorded sequences in decimal form, numerically ordered for this app, `database='postgres'`. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |

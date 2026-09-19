@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// MigrationSetupLockKey serializes initialization and upgrades of the shared
+// MigrationSetupLockKey serializes initialization of the shared
 // public.migrations tracker. Postgres migrations use the same key for their
 // application lock, but setup must acquire it first because the tracker may
 // not exist yet.
