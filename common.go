@@ -28,23 +28,7 @@ type Migration struct {
 //	"1-create-users.up.sql"   -> "1"
 //	"0042_add_field.up.sql"   -> "42"
 func Prefix(name string) string {
-	name = strings.TrimSuffix(name, ".up.sql")
-	name = strings.TrimSuffix(name, ".down.sql")
-
-	// Find separator (underscore or hyphen)
-	sepIdx := -1
-	if i := strings.IndexByte(name, '_'); i > 0 {
-		sepIdx = i
-	} else if i := strings.IndexByte(name, '-'); i > 0 {
-		sepIdx = i
-	}
-
-	var numericPart string
-	if sepIdx > 0 {
-		numericPart = name[:sepIdx]
-	} else {
-		numericPart = name
-	}
+	numericPart := migrationPrefix(name)
 
 	// Normalize by removing leading zeros
 	// "001" -> "1", "0042" -> "42", "1" -> "1"
@@ -56,15 +40,54 @@ func Prefix(name string) string {
 	return normalized
 }
 
-// Sequence returns the numeric migration sequence encoded by name. Migration
-// filenames are required to carry an int64 prefix; the ledger stores that
-// value as BIGINT rather than as a string.
+func migrationPrefix(name string) string {
+	name = strings.TrimSuffix(strings.TrimSuffix(name, ".up.sql"), ".down.sql")
+	if i := strings.IndexAny(name, "_-"); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// Sequence parses an unsigned decimal migration prefix in the BIGINT range.
+// Both separators (0001_schema and 0001-schema) and leading zeros are allowed.
 func Sequence(name string) (int64, error) {
-	sequence, err := strconv.ParseInt(Prefix(name), 10, 64)
+	prefix := migrationPrefix(name)
+	if prefix == "" {
+		return 0, fmt.Errorf("migration %q requires a numeric sequence", name)
+	}
+	for _, c := range prefix {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("migration %q requires an unsigned decimal sequence", name)
+		}
+	}
+	sequence, err := strconv.ParseInt(normalizeNumber(prefix), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("migration %q has invalid numeric sequence %q: %w", name, Prefix(name), err)
+		return 0, fmt.Errorf("migration %q has a sequence outside the BIGINT range: %w", name, err)
 	}
 	return sequence, nil
+}
+
+// ValidateSequences checks numeric identities and increasing order before any
+// migrations run. Zero and gaps are allowed; duplicate, signed, nonnumeric,
+// and overflowing sequences are rejected. LoadFromFS returns this order.
+func ValidateSequences(migrations []Migration) error {
+	seen := make(map[int64]string, len(migrations))
+	var previous int64
+	for i, migration := range migrations {
+		sequence, err := Sequence(migration.Name)
+		if err != nil {
+			return err
+		}
+		if prior, ok := seen[sequence]; ok {
+			return fmt.Errorf("duplicate migration prefix %d: %s and %s", sequence, prior, migration.Name)
+		}
+		if i > 0 && sequence < previous {
+			return fmt.Errorf("migrations must be in numeric sequence order: %s follows %s", migration.Name, migrations[i-1].Name)
+		}
+		seen[sequence] = migration.Name
+		previous = sequence
+	}
+	return nil
 }
 
 // isUndefinedTable reports whether err is Postgres SQLSTATE 42P01

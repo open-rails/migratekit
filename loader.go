@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -22,8 +21,7 @@ func LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error) {
 }
 
 // loadFiles reads all .up.sql files, ordered by numeric prefix (so unpadded
-// names like 2_x and 10_x apply in numeric order), falling back to filename
-// order for non-numeric names. Returns an error if two files normalize to the
+// names like 2_x and 10_x apply in numeric order). Returns an error if two files normalize to the
 // same Prefix() — tracking is prefix-keyed, so a duplicate prefix would
 // silently skip the second file as "already applied". It does NOT verify the
 // parent-link chain; that is Load's job.
@@ -43,6 +41,9 @@ func loadFiles(fsys fs.FS, directory string) ([]Migration, error) {
 			continue
 		}
 
+		if _, err := Sequence(entry.Name()); err != nil {
+			return nil, err
+		}
 		prefix := Prefix(entry.Name())
 		if prior, dup := seen[prefix]; dup {
 			return nil, fmt.Errorf("duplicate migration prefix %q: %s and %s (tracking is prefix-keyed; the second file would be silently skipped)", prefix, prior, entry.Name())
@@ -70,24 +71,11 @@ func loadFiles(fsys fs.FS, directory string) ([]Migration, error) {
 		})
 	}
 
-	// Numeric prefixes sort numerically (1, 2, 10 — not 1, 10, 2);
-	// non-numeric names sort after numeric ones, lexically.
+	// All prefixes were validated above, so numeric sorting is total.
 	sort.Slice(migrations, func(i, j int) bool {
-		ni, iNum := numericPrefix(migrations[i].Name)
-		nj, jNum := numericPrefix(migrations[j].Name)
-		switch {
-		case iNum && jNum:
-			if ni != nj {
-				return ni < nj
-			}
-			return migrations[i].Name < migrations[j].Name
-		case iNum:
-			return true
-		case jNum:
-			return false
-		default:
-			return migrations[i].Name < migrations[j].Name
-		}
+		ni, _ := Sequence(migrations[i].Name)
+		nj, _ := Sequence(migrations[j].Name)
+		return ni < nj
 	})
 
 	return migrations, nil
@@ -96,6 +84,6 @@ func loadFiles(fsys fs.FS, directory string) ([]Migration, error) {
 // numericPrefix parses the normalized Prefix() of a migration filename as an
 // integer. ok is false for names without a numeric prefix.
 func numericPrefix(name string) (n int64, ok bool) {
-	n, err := strconv.ParseInt(Prefix(name), 10, 64)
+	n, err := Sequence(name)
 	return n, err == nil
 }

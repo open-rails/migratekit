@@ -80,13 +80,7 @@ func TestStrict_AppliedMigrationEdited(t *testing.T) {
 	if err := NewPostgres(db, app).ApplyMigrations(ctx, orig); err != nil {
 		t.Fatalf("initial apply: %v", err)
 	}
-	if _, err := db.ExecContext(ctx,
-		`UPDATE public.migrations SET semantic_sha256 = NULL WHERE app = $1`, app); err != nil {
-		t.Fatalf("plant legacy row: %v", err)
-	}
-	if err := NewPostgres(db, app).ApplyMigrations(ctx, orig); err != nil {
-		t.Fatalf("legacy semantic digest backfill: %v", err)
-	}
+
 	var semantic string
 	if err := db.QueryRowContext(ctx,
 		`SELECT COALESCE(semantic_sha256, '') FROM public.migrations WHERE app = $1`, app).Scan(&semantic); err != nil || semantic == "" {

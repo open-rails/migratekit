@@ -59,8 +59,8 @@ type BaselinePlan struct {
 // Empty reports whether a baseline would change nothing.
 func (p BaselinePlan) Empty() bool { return len(p.Record) == 0 && len(p.Retire) == 0 }
 
-func keyOrder(key string) (int, bool) {
-	n, err := strconv.Atoi(key)
+func keyOrder(key string) (int64, bool) {
+	n, err := strconv.ParseInt(key, 10, 64)
 	return n, err == nil
 }
 
@@ -68,13 +68,16 @@ func keyOrder(key string) (int, bool) {
 // baseline must not decide on its own. It reads nothing and writes nothing, so
 // a caller can show the plan before asking for it.
 func PlanBaseline(applied map[string]AppliedRecord, migrations []Migration) (BaselinePlan, error) {
+	if err := ValidateSequences(migrations); err != nil {
+		return BaselinePlan{}, fmt.Errorf("%w: %w", ErrBaselineUnsafe, err)
+	}
 	var plan BaselinePlan
 	if len(migrations) == 0 {
 		return plan, fmt.Errorf("%w: the tree carries no migrations, so there is nothing to baseline against", ErrBaselineUnsafe)
 	}
 
 	tree := make(map[string]Migration, len(migrations))
-	highest, haveHighest := 0, false
+	highest, haveHighest := int64(0), false
 	for _, m := range migrations {
 		key := Prefix(m.Name)
 		tree[key] = m

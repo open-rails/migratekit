@@ -177,7 +177,9 @@ is an implementation detail and may change in any release.
 |---|---|
 | `type Migration struct { Name, Content string }` | One SQL migration: filename + raw file content. |
 | `LoadFromFS(fsys fs.FS, dir ...string) ([]Migration, error)` | Loads every `*.up.sql` in `dir` (default `"."`), ordered by numeric prefix. Errors on duplicate normalized prefixes. Only the first `dir` element is used. |
-| `Prefix(name string) string` | Normalized numeric prefix of a migration filename (`"001_x.up.sql"` → `"1"`). This is the tracking key stored in `public.migrations.sequence`. |
+| `Prefix(name string) string` | Decimal display form of a migration prefix (`"001_x.up.sql"` → `"1"`). |
+| `Sequence(name string) (int64, error)` | Validates and parses the prefix stored as `BIGINT`; accepts zero through 9223372036854775807. |
+| `ValidateSequences([]Migration) error` | Validates numeric, unique, increasing sequence numbers before database operations. Gaps are allowed. |
 | `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
 | `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration. **Since v1.7.0 it hashes the CANONICAL BODY** — the file with its own `-- parent:` header removed — so adding a parent line to an applied migration changes no ledger digest. A headerless file hashes exactly as it did in v1.5.0. |
 | `SemanticContentDigest(content string) string` | *(v1.8.0)* Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
@@ -197,12 +199,12 @@ is an implementation detail and may change in any release.
 | `(*Postgres) Close() error` | Closes the isolated database handle created by `NewPostgresFromPGXPool`; no-op for `NewPostgres` values. |
 | `(*Postgres) WithSchema(schema string, rewriteFrom ...string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Optional `rewriteFrom` canonical schema names are rewritten to `schema` in migration SQL before execution, for portable hard-qualified app DDL such as `openrails.foo`. Tracking stays in `public.migrations`. |
 | `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: atomically initializes/upgrades the tracking tables under the global bootstrap lock, then applies every unapplied migration in order under the migration advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
-| `(*Postgres) Applied(ctx) ([]string, error)` | Recorded migration names (normalized prefixes) for this app, `database='postgres'`. |
+| `(*Postgres) Applied(ctx) ([]string, error)` | Recorded sequences in decimal form, numerically ordered for this app, `database='postgres'`. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |
 | `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | *(v1.6.0)* Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
-| `(*Postgres) Status(ctx, []Migration) (Status, error)` | Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Tracker tables are initialized automatically by mutating operations. |
+| `(*Postgres) Status(ctx, []Migration) (Status, error)` | Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Tracker tables are initialized automatically. |
 | `(*Postgres) RepairAdopt(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Bind the file in the tree as the applied identity for its number. For a ledger that is the stale side. |
 | `(*Postgres) RepairAdoptAllUnmatched(ctx, []Migration, RepairRequest) ([]RepairResult, error)` | *(v1.6.0)* The same for every mismatched row at once — the restored-backup shape. |
 | `(*Postgres) RepairAcceptContent(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Re-stamp the digest after a verified edit; clears the drift warning. Refuses on an identity mismatch. |
@@ -237,7 +239,7 @@ ClickHouse is a separate subpackage so the root package never imports
 
 ### Frozen behavioral contracts
 
-These behaviors are part of the API and will not change within v1.x:
+These behaviors define the current API:
 
 1. **Tracking table**: `public.migrations (id, app, database, schema, sequence, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, sequence))` with `database` ∈ {`postgres`, `clickhouse`}. Since v1.6.0 `public.migration_repairs` records every repair.
 2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is always an operator warning; comment/format-only edits compare cleanly through `semantic_sha256`.
@@ -266,7 +268,7 @@ on every apply:
   both files and demanding a renumber.
 - **Integrity** — a migration edited after it ran is a hard error.
 
-Both are always on. The v2 ledger is a fresh database contract; there are no
+Both are always on. The numeric ledger is a fresh database contract; there are no
 legacy rows to interpret and no compatibility upgrade path. Tracker tables are
 created automatically when an operation needs them.
 
@@ -331,8 +333,7 @@ silent, every digest v1.5.0 wrote is still correct, and there is nothing to back
 
 Content drift is now informational in every API and CLI path; the strict-content
 escape hatch is removed. `semantic_sha256` records a PostgreSQL token digest alongside
-the historical byte digest. Existing rows are upgraded automatically when their old
-digest still matches, after which comments, whitespace, and unquoted-identifier case do
+the byte digest. Comments, whitespace, and unquoted-identifier case do
 not produce warnings. Real token changes still warn with both raw digests and the audited
 `repair accept-content` path. Identity collisions, ordering violations, and unfinished
 no-transaction migrations remain hard errors.
@@ -426,15 +427,19 @@ enough to drop `clickhouse-go`/`ch-go` from `go.mod`/`go.sum`.
 
 ### Compatibility policy
 
-- v1.x releases may **add** symbols, struct fields with useful zero values, and optional behavior — never remove or change what is documented above.
-- Exact error message **text** is not part of the API; only the documented error conditions are. (Typed sentinel errors may be added additively later.)
-- The module follows Go module semver: any future break means v2 with a new import path. The bar for v2 is intentionally very high.
+The numeric-ledger release is an intentional pre-launch database hard cut.
+All controlled applications must reset their databases before adopting it.
+It retains the Go module path and public string keys used by reporting APIs;
+the database columns and bound sequence values are BIGINT/int64. There is no
+legacy ledger conversion path.
+
 
 ## Schema
 
 migratekit creates two tables in the `public` schema automatically on the first
-operation that needs tracking. This is a destructive v2 schema: reset existing
-tracker tables when adopting this release.
+operation that needs tracking. This is a fresh-database hard cut: reset the application databases before
+adopting it. No table renames, column upgrades, or digest backfills run.
+Initialization never drops or converts existing tables.
 
 ```sql
 CREATE TABLE public.migrations (
@@ -442,7 +447,7 @@ CREATE TABLE public.migrations (
     app TEXT NOT NULL,
     database TEXT NOT NULL,
     schema TEXT NOT NULL DEFAULT '',
-    sequence BIGINT NOT NULL,       -- the numeric ledger key: Prefix(filename)
+    sequence BIGINT NOT NULL CHECK (sequence >= 0),       -- the numeric ledger key: Prefix(filename)
     filename TEXT,
     content_sha256 TEXT,
     semantic_sha256 TEXT,
@@ -460,7 +465,7 @@ CREATE TABLE public.migration_repairs (
     app TEXT NOT NULL,
     database TEXT NOT NULL,
     schema TEXT NOT NULL DEFAULT '',
-    sequence BIGINT NOT NULL,       -- the numeric ledger key repaired
+    sequence BIGINT NOT NULL CHECK (sequence >= 0),       -- the numeric ledger key repaired
     verb TEXT NOT NULL,
     reason TEXT NOT NULL,
     operator TEXT NOT NULL DEFAULT '',

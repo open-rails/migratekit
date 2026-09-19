@@ -58,17 +58,14 @@ func (t *Tracker) Applied(ctx context.Context, app string, database string) ([]s
 	return names, rows.Err()
 }
 
-func (t *Tracker) RecordApplied(ctx context.Context, app string, database string, sequence string) error {
+func (t *Tracker) RecordApplied(ctx context.Context, app string, database string, sequence int64) error {
 	if t == nil || t.db == nil {
 		return fmt.Errorf("postgres tracker: db is nil")
 	}
-	n, err := strconv.ParseInt(sequence, 10, 64)
-	if err != nil {
-		return fmt.Errorf("postgres tracker: invalid migration sequence %q: %w", sequence, err)
-	}
-	_, err = t.db.ExecContext(ctx,
+
+	_, err := t.db.ExecContext(ctx,
 		`INSERT INTO public.migrations (app, database, sequence) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-		app, database, n,
+		app, database, sequence,
 	)
 	return err
 }

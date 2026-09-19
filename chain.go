@@ -171,6 +171,9 @@ func Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error) {
 // order (as returned by loadFiles). It reports the FIRST violation, naming both
 // files involved, because a chain error is always about a relationship.
 func VerifyChain(migrations []Migration, opts ...LoadOption) error {
+	if err := ValidateSequences(migrations); err != nil {
+		return err
+	}
 	cfg := newLoadConfig(opts)
 
 	links := make([]ParentLink, len(migrations))

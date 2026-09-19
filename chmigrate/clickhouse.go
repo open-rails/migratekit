@@ -329,6 +329,10 @@ func (c *ClickHouse) execStatements(ctx context.Context, name, content string) e
 // errors. Callers must hold the lock and filter applied migrations first
 // (see ApplyMigrations).
 func (c *ClickHouse) applyOne(ctx context.Context, m migratekit.Migration) error {
+	sequence, err := migratekit.Sequence(m.Name)
+	if err != nil {
+		return err
+	}
 	// First apply generic template substitution (environment variables, etc.)
 	content, err := coremigrate.SubstituteTemplates(m.Content)
 	if err != nil {
@@ -353,12 +357,15 @@ func (c *ClickHouse) applyOne(ctx context.Context, m migratekit.Migration) error
 	if err := c.requireTracker(ctx); err != nil {
 		return err
 	}
-	return c.tracker.RecordApplied(ctx, c.app, clickhouseTrackerDatabase, migratekit.Prefix(m.Name))
+	return c.tracker.RecordApplied(ctx, c.app, clickhouseTrackerDatabase, sequence)
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed)
 // Automatically calls Setup() to ensure migration tables exist before proceeding.
 func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migratekit.Migration) (err error) {
+	if err := migratekit.ValidateSequences(migrations); err != nil {
+		return err
+	}
 	if err := c.Setup(ctx); err != nil {
 		return err
 	}
@@ -415,6 +422,9 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migrateki
 // This is intended for use during application startup to ensure the database
 // schema is up-to-date before the app starts serving requests.
 func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []migratekit.Migration) error {
+	if err := migratekit.ValidateSequences(migrations); err != nil {
+		return err
+	}
 	applied, err := c.Applied(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get applied migrations: %w", err)

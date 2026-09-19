@@ -67,7 +67,7 @@ func TestTracker_Basics(t *testing.T) {
 	mock.ExpectExec("INSERT INTO public\\.migrations").
 		WithArgs("doujins", "clickhouse", int64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	if err := tr.RecordApplied(ctx, "doujins", "clickhouse", "3"); err != nil {
+	if err := tr.RecordApplied(ctx, "doujins", "clickhouse", 3); err != nil {
 		t.Fatalf("RecordApplied: %v", err)
 	}
 

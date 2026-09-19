@@ -19,8 +19,7 @@ import (
 const MigrationSetupLockKey int64 = 7592348109
 
 // EnsurePublicMigrationsTable atomically creates the tracker tables under the
-// shared bootstrap advisory lock. This is a destructive v2 schema: callers
-// must start with a fresh migration database. The tracker
+// shared bootstrap advisory lock. This ledger requires a fresh database; no legacy tables are upgraded. The tracker
 // identity includes `schema` because WithSchema places tables in different
 // schemas of the SAME database: without it, the same app applied to two schemas
 // (e.g. doujins.* and hentai0.* sharing one DB) would record under one identity
@@ -43,7 +42,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 			id BIGSERIAL PRIMARY KEY,
 			app TEXT NOT NULL,
 			database TEXT NOT NULL,
-			sequence BIGINT NOT NULL,
+			sequence BIGINT NOT NULL CHECK (sequence >= 0),
 			schema TEXT NOT NULL DEFAULT '',
 			filename TEXT,
 			content_sha256 TEXT,
@@ -59,7 +58,7 @@ func EnsurePublicMigrationsTable(ctx context.Context, db *sql.DB) error {
 			app TEXT NOT NULL,
 			database TEXT NOT NULL,
 			schema TEXT NOT NULL DEFAULT '',
-			sequence BIGINT NOT NULL,
+			sequence BIGINT NOT NULL CHECK (sequence >= 0),
 			verb TEXT NOT NULL,
 			reason TEXT NOT NULL,
 			operator TEXT NOT NULL DEFAULT '',
