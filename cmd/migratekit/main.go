@@ -45,6 +45,7 @@ COMMANDS
                                 ledger is the stale side
   repair adopt --all-unmatched  the same, for EVERY row that disagrees (the usual shape
                                 of a restore)
+  baseline
   repair accept-content <number>
                                 re-stamp the digest after a verified, cosmetic edit —
                                 acknowledges and silences the content-drift warning
@@ -106,6 +107,8 @@ type opts struct {
 	dryRun       bool
 	allUnmatched bool
 	allowBelow   multiFlag
+
+	schemaVerified bool
 
 	resolveApplied bool
 	resolveRerun   bool
@@ -170,6 +173,7 @@ func run(args []string) error {
 	fs.Var(&o.allowBelow, "allow-below-applied", "exempt this migration from the ordering rule (repeatable)")
 	fs.BoolVar(&o.resolveApplied, "applied", false, "resolve a dirty migration as applied")
 	fs.BoolVar(&o.resolveRerun, "rerun", false, "resolve a dirty migration by dropping its ledger row")
+	fs.BoolVar(&o.schemaVerified, "schema-verified", false, "assert the schema already holds everything the tree's migrations build")
 	fs.BoolVar(&o.requireLinks, "require-links", false, "a migration with no parent link is an error")
 	fs.BoolVar(&o.checkOnly, "check", false, "report what relink would rewrite; write nothing")
 	fs.StringVar(&o.from, "from", "", "relink only migrations at or above this number")
@@ -302,6 +306,20 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Println(res.String())
+		return nil
+
+	case "baseline":
+		results, err := m.Baseline(ctx, migrations, migratekit.BaselineRequest{
+			RepairRequest:  req,
+			SchemaVerified: o.schemaVerified,
+		})
+		if err != nil {
+			return err
+		}
+		for _, r := range results {
+			fmt.Println(r.String())
+		}
+		fmt.Printf("%d ledger row(s) baselined\n", len(results))
 		return nil
 
 	case "repair resolve":
