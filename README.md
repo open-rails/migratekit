@@ -413,7 +413,10 @@ Files **must** follow this pattern: `{number}{separator}{description}.up.sql`
 0003_migrations.up.sql
 ```
 
-❌ **Invalid (will be skipped):**
+Files without the `.up.sql` suffix are ignored. A `.up.sql` file with an invalid
+numeric prefix is rejected.
+
+❌ **Invalid:**
 ```
 001_create_users.sql        # Missing .up.sql
 create_users.up.sql         # Missing numeric prefix
