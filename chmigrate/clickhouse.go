@@ -119,11 +119,6 @@ func (c *ClickHouse) exec(ctx context.Context, sql string) error {
 	return c.conn.Exec(ctx, sql)
 }
 
-// Setup ensures database and tables exist
-func (c *ClickHouse) Setup(ctx context.Context) error {
-	return c.requireTracker(ctx)
-}
-
 // Applied returns list of applied migrations
 func (c *ClickHouse) Applied(ctx context.Context) ([]string, error) {
 	if err := c.requireTracker(ctx); err != nil {
@@ -361,12 +356,12 @@ func (c *ClickHouse) applyOne(ctx context.Context, m migratekit.Migration) error
 }
 
 // ApplyMigrations applies all unapplied migrations (only locks if needed)
-// Automatically calls Setup() to ensure migration tables exist before proceeding.
+// Tracking tables are initialized automatically before proceeding.
 func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migratekit.Migration) (err error) {
 	if err := migratekit.ValidateSequences(migrations); err != nil {
 		return err
 	}
-	if err := c.Setup(ctx); err != nil {
+	if err := c.requireTracker(ctx); err != nil {
 		return err
 	}
 
