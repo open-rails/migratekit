@@ -7,7 +7,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
+func TestClickHouse_AppliedInitializesPostgresTracker(t *testing.T) {
 	ctx := context.Background()
 
 	db, mock, err := sqlmock.New()
@@ -16,7 +16,7 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Setup() must succeed without touching ClickHouse migration tables when PostgresDB is provided.
+	// A normal operation initializes the tracker without connecting to ClickHouse.
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock\\(\\$1\\)").
 		WithArgs(int64(7592348109)).
@@ -24,6 +24,9 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 	mock.ExpectExec("CREATE TABLE IF NOT EXISTS public\\.migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT sequence FROM public\\.migrations").
+		WithArgs("doujins", "clickhouse").
+		WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(int64(1)).AddRow(int64(10)))
 
 	ch := New(&Config{
 		ClientAddr: "invalid:0",
@@ -35,8 +38,12 @@ func TestClickHouse_PostgresTrackerMode_SkipsClickHouseTables(t *testing.T) {
 		Cluster:    "",
 	})
 
-	if err := ch.Setup(ctx); err != nil {
-		t.Fatalf("Setup: %v", err)
+	applied, err := ch.Applied(ctx)
+	if err != nil {
+		t.Fatalf("Applied: %v", err)
+	}
+	if len(applied) != 2 || applied[0] != "1" || applied[1] != "10" {
+		t.Fatalf("applied sequences: %v", applied)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -55,7 +62,7 @@ func TestClickHouse_RequiresPostgresDB(t *testing.T) {
 		App:        "doujins",
 	})
 
-	if err := ch.Setup(ctx); err == nil {
+	if _, err := ch.Applied(ctx); err == nil {
 		t.Fatalf("expected error, got nil")
 	}
 }

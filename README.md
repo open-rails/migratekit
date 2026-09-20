@@ -2,10 +2,25 @@
 
 Minimal database migration library with app-scoped migrations and automatic locking.
 
+## Release baseline
+
+**v1.0.4 is the supported v1 baseline.** It replaces the retired pre-launch v1
+releases and intentionally breaks their public API and database contracts.
+There are no compatibility aliases or legacy-ledger conversions. Reset existing
+application databases before adopting it.
+
+Both database drivers initialize tracking automatically. Neither exposes a
+`Setup` method; use normal operations such as `ApplyMigrations`. Startup validation
+remains read-only. New breaking public API changes require a new major version.
+
+Old public Go downloads cannot be erased or overwritten. Retraction metadata
+excludes the retired versions from normal version queries; see
+[release policy](RELEASING.md).
+
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit
+go get github.com/open-rails/migratekit@v1.0.4
 ```
 
 ## Usage
@@ -112,7 +127,7 @@ err = chmigrate.ValidateMigrations(ctx, &chmigrate.Config{App: "doujins", Postgr
 
 The identity checks stop a migration from silently never running. That is worth a boot
 refusal — but only if there is a way out of it that is not `psql` and a hand-written
-`UPDATE public.migrations`. Since v1.6.0 there is:
+`UPDATE public.migrations`. Use the CLI:
 
 ```bash
 go run github.com/open-rails/migratekit/cmd/migratekit status \
@@ -168,11 +183,10 @@ The same verbs are available to Go callers as `(*Postgres).RepairAdopt`,
 
 ## Stable API (v1)
 
-Everything in this section is the v1 compatibility boundary. Within v1.x it
-will only grow — no removals, no signature changes, no breaking behavior
-changes to the documented contracts below. Anything NOT listed here
-(unexported helpers, exact error message text, internal locking mechanics)
-is an implementation detail and may change in any release.
+This section describes the supported API starting at v1.0.4. It does not promise
+compatibility with the retired releases. Future changes follow Go semantic
+versioning; breaking this public contract requires a new major version.
+Unexported helpers and exact error-message wording are implementation details.
 
 ### Loading
 
@@ -183,15 +197,15 @@ is an implementation detail and may change in any release.
 | `Prefix(name string) string` | Decimal display form of a migration prefix (`"001_x.up.sql"` → `"1"`). |
 | `Sequence(name string) (int64, error)` | Validates and parses the prefix stored as `BIGINT`; accepts zero through 9223372036854775807. |
 | `ValidateSequences([]Migration) error` | Validates numeric, unique, increasing sequence numbers before database operations. Gaps are allowed. |
-| `CheckChain(names []string) error` | *(v1.5.0)* Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
-| `ContentDigest(content string) string` | *(v1.5.0)* The sha256 the ledger records for a migration. **Since v1.7.0 it hashes the CANONICAL BODY** — the file with its own `-- parent:` header removed — so adding a parent line to an applied migration changes no ledger digest. A headerless file hashes exactly as it did in v1.5.0. |
-| `SemanticContentDigest(content string) string` | *(v1.8.0)* Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
+| `CheckChain(names []string) error` | Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
+| `ContentDigest(content string) string` | The SHA-256 of the migration body, excluding its own `-- parent:` header. |
+| `SemanticContentDigest(content string) string` | Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
 | `type AppliedRecord struct { Key, Filename, Digest, SemanticDigest, Status, Error string }` | One current ledger row. `Key` is the decimal representation of the BIGINT `sequence` column. |
-| `Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error)` | *(v1.7.0)* `LoadFromFS` plus options. `RequireParentLinks()` makes a headerless migration an error; `WithChainWarnFunc(fn)` redirects the tolerance warnings. |
-| `VerifyChain(migrations []Migration, opts ...LoadOption) error` | *(v1.7.0)* The parent-link check on an already-loaded chain. |
-| `CheckChainFS(fsys fs.FS, dir string, requireLinks bool) error` | *(v1.7.0)* The CI gate: `CheckChain`'s numbering rules plus parent-link validation, which needs the bytes and not just the names. |
-| `CheckRepairTotality(fsys fs.FS, dir string) error` | *(v1.7.0)* Refuses a constraint over pre-existing data that carries no repair. Pure file analysis. |
-| `Relink(dir string, RelinkOptions) ([]RelinkChange, error)` | *(v1.7.0)* Rewrites parent lines to match the current order. Files only — no database, no audit, CI-safe. |
+| `Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error)` | `LoadFromFS` plus options. `RequireParentLinks()` makes a headerless migration an error; `WithChainWarnFunc(fn)` redirects the tolerance warnings. |
+| `VerifyChain(migrations []Migration, opts ...LoadOption) error` | The parent-link check on an already-loaded chain. |
+| `CheckChainFS(fsys fs.FS, dir string, requireLinks bool) error` | The CI gate: `CheckChain`'s numbering rules plus parent-link validation, which needs the bytes and not just the names. |
+| `CheckRepairTotality(fsys fs.FS, dir string) error` | Refuses a constraint over pre-existing data that carries no repair. Pure file analysis. |
+| `Relink(dir string, RelinkOptions) ([]RelinkChange, error)` | Rewrites parent lines to match the current order. Files only — no database, no audit, CI-safe. |
 
 ### Postgres
 
@@ -204,20 +218,20 @@ is an implementation detail and may change in any release.
 | `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: atomically initializes the tracking tables under the global bootstrap lock, then applies every unapplied migration in order under the migration advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
 | `(*Postgres) Applied(ctx) ([]string, error)` | Recorded sequences in decimal form, numerically ordered for this app, `database='postgres'`. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
-| `(*Postgres) WithStrictOrdering() *Postgres` | *(v1.5.0)* Refuse a pending migration that sorts below one already applied. Opt-in. |
-| `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | *(v1.5.0)* Ledger keyed by tracking key, carrying the recorded filename and content digest. |
-| `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | *(v1.6.0)* Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
+| `(*Postgres) WithStrictOrdering() *Postgres` | Refuse a pending migration that sorts below one already applied. Opt-in. |
+| `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | Ledger keyed by tracking key, carrying the recorded filename and content digest. |
+| `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
 | `(*Postgres) Status(ctx, []Migration) (Status, error)` | Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Tracker tables are initialized automatically. |
-| `(*Postgres) RepairAdopt(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Bind the file in the tree as the applied identity for its number. For a ledger that is the stale side. |
-| `(*Postgres) RepairAdoptAllUnmatched(ctx, []Migration, RepairRequest) ([]RepairResult, error)` | *(v1.6.0)* The same for every mismatched row at once — the restored-backup shape. |
-| `(*Postgres) RepairAcceptContent(ctx, Migration, RepairRequest) (RepairResult, error)` | *(v1.6.0)* Re-stamp the digest after a verified edit; clears the drift warning. Refuses on an identity mismatch. |
-| `(*Postgres) ApplyWithOrderingException(ctx, []Migration, allowBelow []string, RepairRequest) error` | *(v1.6.0)* Apply with a one-shot exemption from the ordering rule. Identity checks are not relaxed. |
-| `(*Postgres) RepairHistory(ctx) ([]RepairRecord, error)` | *(v1.6.0)* The audit trail, newest first. |
-| `type RepairRequest struct { Reason, Operator string; DryRun bool }` | *(v1.6.0)* `Reason` is required. Every repair refuses under CI (`DetectCI`). |
-| `type Status`, `type Discrepancy`, `type RepairResult`, `type RepairRecord`, `Severity`, `DiscrepancyKind` | *(v1.6.0)* Reporting types. `Discrepancy.String()` is the full explanation; `OneLine()` is the log-line form. |
-| `DetectCI() (string, bool)` | *(v1.6.0)* Names the CI environment variable that is set, if any. |
+| `(*Postgres) RepairAdopt(ctx, Migration, RepairRequest) (RepairResult, error)` | Bind the file in the tree as the applied identity for its number. For a ledger that is the stale side. |
+| `(*Postgres) RepairAdoptAllUnmatched(ctx, []Migration, RepairRequest) ([]RepairResult, error)` | The same for every mismatched row at once — the restored-backup shape. |
+| `(*Postgres) RepairAcceptContent(ctx, Migration, RepairRequest) (RepairResult, error)` | Re-stamp the digest after a verified edit; clears the drift warning. Refuses on an identity mismatch. |
+| `(*Postgres) ApplyWithOrderingException(ctx, []Migration, allowBelow []string, RepairRequest) error` | Apply with a one-shot exemption from the ordering rule. Identity checks are not relaxed. |
+| `(*Postgres) RepairHistory(ctx) ([]RepairRecord, error)` | The audit trail, newest first. |
+| `type RepairRequest struct { Reason, Operator string; DryRun bool }` | `Reason` is required. Every repair refuses under CI (`DetectCI`). |
+| `type Status`, `type Discrepancy`, `type RepairResult`, `type RepairRecord`, `Severity`, `DiscrepancyKind` | Reporting types. `Discrepancy.String()` is the full explanation; `OneLine()` is the log-line form. |
+| `DetectCI() (string, bool)` | Names the CI environment variable that is set, if any. |
 
-### ClickHouse (`migratekit/chmigrate`, since v1.4.0)
+### ClickHouse (`migratekit/chmigrate`)
 
 ClickHouse is a separate subpackage so the root package never imports
 `github.com/ClickHouse/clickhouse-go/v2`. Its stable surface:
@@ -227,8 +241,7 @@ ClickHouse is a separate subpackage so the root package never imports
 | `type Config struct { ClientAddr, Database, Username, Password, App, Cluster string; PostgresDB *sql.DB }` | `PostgresDB` is required: tracking rows live in Postgres `public.migrations` (`database='clickhouse'`) and locking uses Postgres advisory locks. `Cluster` enables `{{ON_CLUSTER}}` expansion. |
 | `New(*Config) *ClickHouse` | Migrator; connects to ClickHouse lazily via native protocol. |
 | `(*ClickHouse) ApplyMigrations(ctx, []migratekit.Migration) error` | Same shape as Postgres. Statements run individually (no transactions) with up-to-30s retry on transient distributed-DDL errors. |
-| `(*ClickHouse) Applied(ctx) ([]string, error)` | Recorded names for this app, `database='clickhouse'`. |
-| `(*ClickHouse) Setup(ctx) error` | Ensures the Postgres tracker is ready. |
+| `(*ClickHouse) Applied(ctx) ([]string, error)` | Recorded sequences for this app, `database='clickhouse'`; initializes the Postgres tracker automatically. |
 | `(*ClickHouse) ValidateAllApplied(ctx, []migratekit.Migration) error` | Read-only startup gate. |
 | `(*ClickHouse) Close() error` | Closes only the native ClickHouse connection the migrator itself opened (never `PostgresDB`). |
 | `ValidateMigrations(ctx, *Config, fs.FS) error` | `LoadFromFS` + `ValidateAllApplied` in one call, mirroring `ValidatePostgresMigrations` for a single ClickHouse app. |
@@ -244,189 +257,82 @@ ClickHouse is a separate subpackage so the root package never imports
 
 These behaviors define the current API:
 
-1. **Tracking table**: `public.migrations (id, app, database, schema, sequence, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, sequence))` with `database` ∈ {`postgres`, `clickhouse`}. Since v1.6.0 `public.migration_repairs` records every repair.
+1. **Tracking table**: `public.migrations (id, app, database, schema, sequence, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, sequence))` with `database` ∈ {`postgres`, `clickhouse`}. `public.migration_repairs` records every repair.
 2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is always an operator warning; comment/format-only edits compare cleanly through `semantic_sha256`.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
 6. **Postgres atomicity**: one migration = one transaction — the DDL and its ledger row commit together, so a failed migration applies nothing and records nothing. **The one exception is explicit**: a migration whose leading comment block carries `-- migratekit:no-transaction` runs outside a transaction and can fail half-applied; the ledger then records it `failed` (or `running` after a crash) and boot refuses until an operator resolves it.
 7. **Postgres schema targeting**: `WithSchema(schema)` sets a per-migration transaction search path for unqualified SQL. `WithSchema(schema, "canonical")` also rewrites app-owned canonical schema references to `schema` before execution; use this for portable hard-qualified DDL, not for shared schemas like `public`.
-7. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
-8. **Ownership**: migrators never close a `*sql.DB` you pass in.
+8. **ClickHouse non-atomicity**: statements are split (quote-aware) and run individually; a partial failure leaves earlier statements applied and the migration unrecorded — every statement must be individually idempotent.
+9. **Ownership**: migrators never close a `*sql.DB` you pass in.
 
-### Added in v1.5.0 (migration identity)
+### Identity, content drift, and repairs
 
-The applied-migrations ledger was keyed by the migration NUMBER alone, which is
-not an identity: two different files that each claim number N normalize to the
-same key, so once one is applied the other is reported "already applied" and
-its DDL never runs — no error, clean boot, green suite. `LoadFromFS` rejects two
-colliding files in one tree, but the damaging case never has both in one tree:
-lane A's N is applied to a live database, lane B renumbers or reverts, and B's N
-is skipped forever.
+Each migration is identified by its numeric sequence within its application,
+database driver, and configured schema. A different filename claiming an applied
+sequence is an error. Edited SQL emits a warning; comments, whitespace, and
+unquoted-identifier case are ignored by the semantic digest. Content drift does
+not block startup. `WithStrictOrdering` optionally rejects pending migrations
+below an already-applied sequence.
 
-v1.5.0 records `filename` and `content_sha256` next to the key and checks them
-on every apply:
+`Status` explains discrepancies. The CLI repair commands and their corresponding
+Go methods record the operator's reason and ledger change together in
+`public.migration_repairs`. They do not reconstruct application tables or convert
+an older ledger schema.
 
-- **Identity** — number N applied by a different file is a hard error naming
-  both files and demanding a renumber.
-- **Integrity** — a migration edited after it ran is a hard error.
+### Parent links and authoring checks
 
-Both are always on. The numeric ledger is a fresh database contract; there are no
-legacy rows to interpret and no compatibility upgrade path. Tracker tables are
-created automatically when an operation needs them.
-
-- **Ordering** — `WithStrictOrdering()` additionally refuses a pending migration
-  that sorts below one already applied. Opt-in, because existing chains
-  legitimately carry gaps and late arrivals that predate the rule.
-- `CheckChain(names)` validates a chain as a plain file listing (duplicates,
-  gaps, monotonicity) with no database, for a CI gate on the merge boundary.
-
-Execution is unchanged: appliers are serialized by the advisory lock and
-migrations run one at a time, in order.
-
-### Changed in v1.6.0 (the resolution path)
-
-v1.5.0 made three failures visible. It did not make any of them *resolvable*: the boot
-refused, named the problem, and left the operator with `psql`. v1.6.0 is the other half —
-`status`, four audited repair verbs, and one relaxation.
-
-**Content drift is now a WARNING, not a boot error.** An operator who edited a migration
-that already ran often cannot restore the old bytes, and a database held down over a
-comment change is a worse outcome than the divergence the check guards against. The boot
-proceeds and emits a warning naming the file, both digests, the risk, and
-`repair accept-content`. Content drift has no boot-refusal mode: stopping the
-application cannot repair either the migration file or the already-applied schema.
-
-The other two are unchanged. A number applied by a different file is still a hard error —
-it is the silent-never-runs killer, and its fix (renumber, or adopt) is always available.
-`WithStrictOrdering()` behaves exactly as before.
-
-Everything else is additive: `Status`, `WithWarnFunc`, the repair verbs, the
-`public.migration_repairs` audit table (created by `Setup`), and the `cmd/migratekit` CLI.
-No consumer action is required, and no call site changes.
-
-### Added in v1.7.0 (parent links, no-transaction, repair totality)
-
-**Parent-hash links.** Every migration carries its parent as its first non-blank line:
+A migration may declare its immediate predecessor on the first non-blank line:
 
 ```sql
--- parent: 5 sha256:9f2c…e1
+-- parent: 5 sha256:<digest-of-the-parent-body>
 ```
 
-and the first migration of the chain carries `-- parent: root`. The chain is verified at
-LOAD — pure file reading, no database — so boot and CI both inherit it, and there is no
-second verification point to keep in sync.
+The first migration declares `-- parent: root`. `Load` verifies declared links
+while reading files, before any database access. `RequireParentLinks()` also
+rejects files without a header. Parent links must match the preceding migration's
+number and canonical content digest. The digest excludes the migration's own
+parent header.
 
-Two things follow. An ordering conflict becomes structurally impossible: the lane that
-merges second has a parent line pointing at a file that is no longer its predecessor,
-which is a deterministic refusal in its own PR rather than a boot refusal in production.
-And the directory becomes a hash chain: tampering with history breaks every later link,
-which is `atlas.sum`'s property with no sum file to maintain.
-
-Refused, each naming both files: a missing parent, a hash mismatch, two files claiming the
-same parent, two roots, a root that is not the lowest-numbered file, a link that points
-forward, and a link that skips the immediate predecessor (the stale-after-renumber shape).
-
-**The digest excludes the parent line.** `ContentDigest` hashes the canonical body — the
-file with its own header removed — and that is also what `content_sha256` stores. Adding
-parent lines to already-applied migrations therefore changes no ledger digest: adoption is
-silent, every digest v1.5.0 wrote is still correct, and there is nothing to backfill.
-
-### Changed in v1.8.0 (warning-only semantic drift)
-
-Content drift is now informational in every API and CLI path; the strict-content
-escape hatch is removed. `semantic_sha256` records a PostgreSQL token digest alongside
-the byte digest. Comments, whitespace, and unquoted-identifier case do
-not produce warnings. Real token changes still warn with both raw digests and the audited
-`repair accept-content` path. Identity collisions, ordering violations, and unfinished
-no-transaction migrations remain hard errors.
-
-**Renumbering** is now `git mv` PLUS updating your parent line. The error message says so,
-and `migratekit relink` does it in one command:
+After renumbering or editing migrations, update their parent links with:
 
 ```bash
-migratekit relink -dir migrations/postgres            # fix the parent lines
-migratekit relink -dir migrations/postgres --check    # CI: exit 1 if any are stale
+migratekit relink -dir migrations/postgres
+migratekit relink -dir migrations/postgres --check
 ```
 
-`relink` is an AUTHORING verb and deliberately does NOT carry the repair verbs' guardrails
-— no `--reason`, no audit row, no CI refusal. The repair verbs mutate a production ledger:
-state that is invisible, shared, and has no history of its own. `relink` mutates files,
-and files already have an audit log — git. A `--reason` would duplicate the commit
-message, an audit table cannot record a change that may never be committed, and refusing
-to run in CI would be wrong because `relink --check` *is* the CI gate.
+`relink` edits source files only. It does not write to the database or need a
+repair reason. A squashed chain starts with a new root file.
 
-**A squash resets the chain root**, with no special case in the code: a squash deletes the
-files it replaces, so the squash file is the lowest-numbered file present and legitimately
-carries `-- parent: root`. One rule — exactly one root, and it must be the lowest-numbered
-file — covers squashes and ordinary chains alike.
-
-**Adoption.** Headerless migrations are tolerated with a warning for one minor version.
-Mixed chains work: a headed file verifies against a headerless parent (hashing a parent
-does not require the parent to have a header), so a repo adopts by heading its newest file
-and letting the rest follow. `Load(fsys, dir, RequireParentLinks())` makes a missing header
-an error. The default flips no earlier than v1.8.0.
-
-**`-- migratekit:no-transaction`.** Migrations are transactional by default and the ledger
-row commits with the DDL. `CREATE INDEX CONCURRENTLY` — the only index build that does not
-take an `ACCESS EXCLUSIVE` lock on a live table — cannot live inside that, so a migration
-whose leading comment block carries the directive runs outside a transaction, one
-statement at a time, still under the advisory lock.
-
-Such a migration may be PARTIALLY applied, and no design makes it atomic. So the ledger
-holds the state instead of hiding it: `running` before it executes, `applied` on success,
-`failed` with the Postgres error text on failure, and still `running` if the process dies.
-**Boot refuses on any row that is not `applied`** — not absent, which would silently re-run
-half-applied DDL, and not applied, which would silently skip the other half. The operator
-clears it with the audited `migratekit repair resolve N --applied|--rerun --reason "…"`.
-
-**Repair totality.** A constraint added over a table that already has rows is a bet that
-the rows comply, and when the bet loses it fails on a live database mid-boot. So:
-
-> A constraint over a PRE-EXISTING table must be preceded, in the same file, by either the
-> repair DML that makes the data satisfy it, or `-- Repair: none-needed <reason>`.
-
-Position is the rule, not a detail: a repair below the constraint runs after the
-constraint has already refused the rows. A table `CREATE TABLE`d in the same file is
-exempt — no pre-existing row can exist. Detection is a conservative lexical scan of the
-closed set of DDL that can refuse stored rows (`ADD CONSTRAINT … CHECK` / `FOREIGN KEY` /
-`UNIQUE`, `VALIDATE CONSTRAINT`, `CREATE UNIQUE INDEX`, `SET NOT NULL`, `ALTER COLUMN …
-TYPE`, `ADD COLUMN … NOT NULL` with no default); when it cannot resolve which table a
-statement targets it reports UNKNOWN and requires the waiver rather than guessing.
-
-Measuring the real data is how you *choose* the repair — delete versus backfill is a
-semantic call you cannot make without looking at the rows — but nothing requires or parses
-a measurement. `CheckRepairTotality` enforces the repair.
+`CheckRepairTotality` and `migratekit check` inspect constraints on pre-existing
+tables. Repair DML must precede the constraint, or the file must explain why no
+repair is needed with `-- Repair: none-needed <reason>`. Tables created in the same
+migration are exempt. Unresolved statement targets require an explicit waiver.
 
 ```bash
-migratekit check -dir migrations/postgres --require-links   # numbering + links + repair rule
+migratekit check -dir migrations/postgres --require-links
 ```
 
-### Removed in v1.0 (was public in v0.x)
+### Non-transactional PostgreSQL migrations
 
-- `Postgres.Apply`, `Postgres.Lock`, `Postgres.Unlock`, `ClickHouse.Apply`, `ClickHouse.Lock`, `ClickHouse.Unlock` — the manual lock/apply path bypassed the applied-set check and made stateful locking part of the surface; `ApplyMigrations` is the supported path. (No known consumer used these.)
-- `Postgres.Close` — closed the caller's `*sql.DB`, which the migrator never owned.
-- `MigrationSource.FS` and the `ValidateClickHouseMigrations` filesystem parameter are now `fs.FS` instead of `embed.FS` (source-compatible: `embed.FS` satisfies `fs.FS`).
+Every PostgreSQL migration runs in a transaction unless its leading comment
+block explicitly contains:
 
-### Changed in v1.4.0 (ClickHouse moved to its own subpackage)
+```sql
+-- migratekit:no-transaction
+```
 
-Everything ClickHouse-related moved from the root package into
-`migratekit/chmigrate`, to get `github.com/ClickHouse/clickhouse-go/v2` (and
-its `ch-go` dependency) out of every Postgres-only consumer's build:
+Use this for commands such as `CREATE INDEX CONCURRENTLY` that cannot run inside
+a transaction. Migratekit does not infer transaction support by scanning SQL.
+Statements execute individually under the migration lock. The ledger records
+`running`, then `applied` on success or `failed` with the error on failure. A crash
+may leave `running`.
 
-- `migratekit.ClickHouseConfig` → `chmigrate.Config` (same fields).
-- `migratekit.NewClickHouse` → `chmigrate.New` (same signature, returns `*chmigrate.ClickHouse`).
-- `migratekit.ClickHouse` → `chmigrate.ClickHouse` (same methods).
-- `migratekit.ValidateClickHouseMigrations` → `chmigrate.ValidateMigrations`.
-
-**Migration for existing ClickHouse consumers:** change the import to add
-`"github.com/open-rails/migratekit/chmigrate"`, and replace
-`migratekit.NewClickHouse(&migratekit.ClickHouseConfig{...})` with
-`chmigrate.New(&chmigrate.Config{...})`. `migratekit.Migration` and
-`migratekit.Prefix` are unchanged and still used for migration content.
-
-Postgres-only consumers need no code changes; running `go mod tidy` is
-enough to drop `clickhouse-go`/`ch-go` from `go.mod`/`go.sum`.
+An unfinished non-transactional migration requires operator resolution before
+another apply. Inspect and repair the database, then use
+`migratekit repair resolve N --applied|--rerun --reason "..."`. Ordinary
+transactional failures roll back both the migration and its ledger row.
 
 ### Compatibility policy
 
@@ -460,9 +366,7 @@ CREATE TABLE public.migrations (
     UNIQUE(app, database, schema, sequence)
 );
 
--- v1.6.0: every `migratekit repair` lands here, in the same transaction as the
--- identity change it made. The checks are only worth having if there is a way
--- past them; this is what keeps that way honest.
+-- Each repair is recorded in the same transaction as its ledger change.
 CREATE TABLE public.migration_repairs (
     id BIGSERIAL PRIMARY KEY,
     app TEXT NOT NULL,
@@ -496,7 +400,7 @@ Locking:
 
 Files **must** follow this pattern: `{number}{separator}{description}.up.sql`
 
-- **Number**: Any positive integer (leading zeros optional: `1`, `01`, `001` all work)
+- **Number**: An integer from 0 through 9223372036854775807 (leading zeros are optional)
 - **Separator**: Underscore `_` or hyphen `-`
 - **Suffix**: Must end with `.up.sql`
 
@@ -509,7 +413,10 @@ Files **must** follow this pattern: `{number}{separator}{description}.up.sql`
 0003_migrations.up.sql
 ```
 
-❌ **Invalid (will be skipped):**
+Files without the `.up.sql` suffix are ignored. A `.up.sql` file with an invalid
+numeric prefix is rejected.
+
+❌ **Invalid:**
 ```
 001_create_users.sql        # Missing .up.sql
 create_users.up.sql         # Missing numeric prefix
@@ -523,8 +430,8 @@ create_users.up.sql         # Missing numeric prefix
 
 **What gets stored:**
 Numeric prefixes are normalized (leading zeros removed) before storage:
-- `001`, `01`, `1` all become `"1"`
-- `042`, `42` both become `"42"`
+- `001`, `01`, `1` all become integer `1`
+- `042`, `42` both become integer `42`
 
 **Ordering:** migrations apply in numeric-prefix order (`2_x` before `10_x`),
 not lexical filename order, so unpadded prefixes are safe.
@@ -534,13 +441,13 @@ normalized prefix, two files sharing a prefix (`002_users.up.sql` +
 `002_roles.up.sql`, or `0042_x` vs `42_y`) would mean the second silently
 never runs. `LoadFromFS` returns an error instead.
 
-**Parent line (v1.7.0):** the first non-blank line of a migration is
+**Parent line:** the first non-blank line of a migration is
 `-- parent: <number> sha256:<digest-of-the-parent's-canonical-body>`, or
 `-- parent: root` for the lowest-numbered file. The whole chain is verified at load.
 Renumbering means `git mv` *and* updating that line — `migratekit relink` does both parts
-of the second half. Headerless files are tolerated with a warning for one minor version.
+of the second half. Use `RequireParentLinks()` to require headers on every file.
 
-**Repair rule (v1.7.0):** a migration that adds a constraint over a table that already has
+**Repair rule:** a migration that adds a constraint over a table that already has
 rows must carry, ABOVE the constraint, the DML that repairs the offending rows — or
 `-- Repair: none-needed <reason>`. Tables created in the same file are exempt. Measuring
 the real data first is how you decide between deleting and backfilling; the gate enforces

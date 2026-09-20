@@ -2,6 +2,23 @@ module github.com/open-rails/migratekit
 
 go 1.25
 
+// Superseded pre-launch APIs and ledger formats. Use the v1.0.4 baseline.
+retract (
+	v1.9.2 // Retraction metadata only; this tag retracts itself.
+	v1.9.1
+	v1.9.0
+	v1.8.0
+	v1.7.0
+	v1.6.0
+	v1.5.0
+	v1.4.0
+	v1.3.0
+	v1.2.0
+	v1.1.1
+	v1.1.0
+	[v1.0.0, v1.0.3]
+)
+
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.40.3
 	github.com/DATA-DOG/go-sqlmock v1.5.2
