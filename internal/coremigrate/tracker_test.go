@@ -53,24 +53,6 @@ func TestTracker_Basics(t *testing.T) {
 		t.Fatalf("Setup: %v", err)
 	}
 
-	mock.ExpectQuery("SELECT sequence FROM public\\.migrations").
-		WithArgs("doujins", "clickhouse").
-		WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(int64(1)).AddRow(int64(2)))
-	applied, err := tr.Applied(ctx, "doujins", "clickhouse")
-	if err != nil {
-		t.Fatalf("Applied: %v", err)
-	}
-	if len(applied) != 2 || applied[0] != "1" || applied[1] != "2" {
-		t.Fatalf("Applied: unexpected results: %#v", applied)
-	}
-
-	mock.ExpectExec("INSERT INTO public\\.migrations").
-		WithArgs("doujins", "clickhouse", int64(3)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-	if err := tr.RecordApplied(ctx, "doujins", "clickhouse", 3); err != nil {
-		t.Fatalf("RecordApplied: %v", err)
-	}
-
 	mock.ExpectExec("SELECT pg_advisory_lock\\(\\$1\\)").
 		WithArgs(int64(123)).
 		WillReturnResult(sqlmock.NewResult(0, 1))

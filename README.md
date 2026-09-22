@@ -120,7 +120,7 @@ err := migratekit.ValidatePostgresMigrations(ctx, db,
 )
 
 // ClickHouse equivalent, in the chmigrate subpackage:
-err = chmigrate.ValidateMigrations(ctx, &chmigrate.Config{App: "doujins", PostgresDB: pg}, clickhouseFS)
+err = chmigrate.ValidateMigrations(ctx, &chmigrate.Config{App: "doujins", Database: "analytics", PostgresDB: pg}, clickhouseFS)
 ```
 
 ## When boot refuses: operator runbook
@@ -238,10 +238,10 @@ ClickHouse is a separate subpackage so the root package never imports
 
 | Symbol | Contract |
 |---|---|
-| `type Config struct { ClientAddr, Database, Username, Password, App, Cluster string; PostgresDB *sql.DB }` | `PostgresDB` is required: tracking rows live in Postgres `public.migrations` (`database='clickhouse'`) and locking uses Postgres advisory locks. `Cluster` enables `{{ON_CLUSTER}}` expansion. |
+| `type Config struct { ClientAddr, Database, Username, Password, App, Cluster string; PostgresDB *sql.DB }` | `Database` and `PostgresDB` are required: tracking rows live in Postgres `public.migrations` (`database='clickhouse'`) and locking uses Postgres advisory locks. `Cluster` enables `{{ON_CLUSTER}}` expansion. |
 | `New(*Config) *ClickHouse` | Migrator; connects to ClickHouse lazily via native protocol. |
 | `(*ClickHouse) ApplyMigrations(ctx, []migratekit.Migration) error` | Same shape as Postgres. Statements run individually (no transactions) with up-to-30s retry on transient distributed-DDL errors. |
-| `(*ClickHouse) Applied(ctx) ([]string, error)` | Recorded sequences for this app, `database='clickhouse'`; initializes the Postgres tracker automatically. |
+| `(*ClickHouse) Applied(ctx) ([]string, error)` | Applied sequences for this app and explicit target database; initializes the Postgres tracker automatically. |
 | `(*ClickHouse) ValidateAllApplied(ctx, []migratekit.Migration) error` | Read-only startup gate. |
 | `(*ClickHouse) Close() error` | Closes only the native ClickHouse connection the migrator itself opened (never `PostgresDB`). |
 | `ValidateMigrations(ctx, *Config, fs.FS) error` | `LoadFromFS` + `ValidateAllApplied` in one call, mirroring `ValidatePostgresMigrations` for a single ClickHouse app. |
@@ -493,3 +493,27 @@ Different apps (doujins, hentai0, billing) have independent migration sequences 
 
 ### Why single table?
 Easy to query "show all migrations" and simpler permissions.
+
+### ClickHouse ledger identity
+
+`Config.Database` must explicitly select a nonblank target. One Postgres ledger
+owns one logical ClickHouse deployment. Rows are scoped by app,
+`database='clickhouse'`, and `schema=Config.Database`; a second target database
+receives its own migrations. Connection addresses, replicas, credentials and
+cluster names do not change that identity. Independent deployments with the
+same database name must use separate Postgres ledgers. Locks serialize all apps
+for a target database, including connections through different aliases.
+
+Before applying any DDL, the complete supplied migration set must match every
+recorded filename and exact source SHA256 in its scope. Missing files, changed
+bytes, and old rows without a target scope are errors; there is no legacy
+adoption. Digests cover source before template expansion, so deployment
+environment values are not migration identity.
+
+ClickHouse DDL is not transactional. A `running` row records identity before
+execution and becomes `applied` only after every statement succeeds. Calling
+`ApplyMigrations` again replays an identical incomplete migration from its first
+statement; migrations must be idempotent for that recovery to be safe. Changed
+source is refused even after partial execution. The read-only startup validators
+never initialize the ledger and reject pending or incomplete migrations, drift,
+and a missing ledger. They do not inspect physical ClickHouse objects.
