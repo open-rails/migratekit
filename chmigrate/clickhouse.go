@@ -93,9 +93,6 @@ func (c *ClickHouse) requireTracker(ctx context.Context) error {
 	if err := c.validateConfig(); err != nil {
 		return err
 	}
-	if c.tracker == nil {
-		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking")
-	}
 	if err := c.tracker.Setup(ctx); err != nil {
 		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking: %w", err)
 	}

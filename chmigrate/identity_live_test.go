@@ -27,20 +27,26 @@ func TestLiveTargetIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Close()
+	t.Cleanup(func() { _ = pg.Close() })
 	pg.SetMaxOpenConns(1)
 	user, pass := os.Getenv("MIGRATEKIT_TEST_CLICKHOUSE_USER"), os.Getenv("MIGRATEKIT_TEST_CLICKHOUSE_PASS")
 	ch, err := clickhouse.Open(&clickhouse.Options{Addr: []string{addr}, Auth: clickhouse.Auth{Username: user, Password: pass}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ch.Close()
+	t.Cleanup(func() { _ = ch.Close() })
 	app := fmt.Sprintf("mk_identity_%d", time.Now().UnixNano())
 	t.Cleanup(func() {
 		_, _ = pg.ExecContext(context.Background(), "DELETE FROM public.migrations WHERE app = $1", app)
 	})
 	newMigrator := func(db, address string) *ClickHouse {
-		m := New(&Config{App: app, Database: db, ClientAddr: address, Username: user, Password: pass, PostgresDB: pg})
+		pool, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.SetMaxOpenConns(1)
+		t.Cleanup(func() { _ = pool.Close() })
+		m := New(&Config{App: app, Database: db, ClientAddr: address, Username: user, Password: pass, PostgresDB: pool})
 		t.Cleanup(func() { _ = m.Close() })
 		return m
 	}
@@ -136,6 +142,20 @@ func TestLiveTargetIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := a.ValidateAllApplied(ctx, partial); err != nil {
+		t.Fatal(err)
+	}
+	// A read-only Postgres session can validate without any ClickHouse connection.
+	if _, err := pg.ExecContext(ctx, "SET default_transaction_read_only = on"); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := New(&Config{App: app, Database: targets[0], PostgresDB: pg, ClientAddr: "invalid:0"})
+	if err := readOnly.ValidateAllApplied(ctx, partial); err != nil {
+		t.Fatal(err)
+	}
+	if readOnly.conn != nil {
+		t.Fatal("validation connected to ClickHouse")
+	}
+	if _, err := pg.ExecContext(ctx, "SET default_transaction_read_only = off"); err != nil {
 		t.Fatal(err)
 	}
 	// Unbound old history is not adopted or mistaken for a fresh target.
