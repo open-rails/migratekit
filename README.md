@@ -4,10 +4,12 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.0.4 is the supported v1 baseline.** It replaces the retired pre-launch v1
-releases and intentionally breaks their public API and database contracts.
-There are no compatibility aliases or legacy-ledger conversions. Reset existing
-application databases before adopting it.
+**v1.0.5 is the recommended v1 release.** It includes the fresh v1.0.4 API
+baseline and corrects ClickHouse target-database scoping and migration identity
+validation. The baseline replaced the retired pre-launch public API and database
+contracts; there are no compatibility aliases or legacy-ledger conversions.
+Reset pre-launch application databases before adoption. ClickHouse requires a
+fresh, target-scoped ledger; old unscoped rows are rejected without conversion.
 
 Both database drivers initialize tracking automatically. Neither exposes a
 `Setup` method; use normal operations such as `ApplyMigrations`. Startup validation
@@ -20,7 +22,7 @@ excludes the retired versions from normal version queries; see
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit@v1.0.4
+go get github.com/open-rails/migratekit@v1.0.5
 ```
 
 ## Usage
