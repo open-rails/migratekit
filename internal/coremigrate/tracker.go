@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"strconv"
 	"sync"
 )
 
@@ -34,39 +33,54 @@ func (t *Tracker) Setup(ctx context.Context) error {
 	return EnsurePublicMigrationsTable(ctx, t.db)
 }
 
-func (t *Tracker) Applied(ctx context.Context, app string, database string) ([]string, error) {
-	if t == nil || t.db == nil {
-		return nil, fmt.Errorf("postgres tracker: db is nil")
+// TrackedMigration is the identity and completion state of a non-Postgres migration.
+type TrackedMigration struct {
+	Sequence                 int64
+	Filename, Digest, Status string
+}
+
+// executor uses the pinned lock session so even a one-connection pool can migrate.
+func (t *Tracker) executor() interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+} {
+	t.lockMu.Lock()
+	defer t.lockMu.Unlock()
+	if t.lockConn != nil {
+		return t.lockConn
 	}
-	rows, err := t.db.QueryContext(ctx,
-		`SELECT sequence FROM public.migrations WHERE app = $1 AND database = $2 ORDER BY sequence`,
-		app, database,
-	)
+	return t.db
+}
+
+// Records reads only. Empty-schema rows are refused because their target is unknown.
+func (t *Tracker) Records(ctx context.Context, app, database, schema string) ([]TrackedMigration, error) {
+	rows, err := t.executor().QueryContext(ctx, `SELECT sequence, COALESCE(filename, ''), COALESCE(content_sha256, ''), status, schema
+ FROM public.migrations WHERE app = $1 AND database = $2 AND (schema = $3 OR schema = '') ORDER BY sequence`, app, database, schema)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var names []string
+	var out []TrackedMigration
 	for rows.Next() {
-		var sequence int64
-		if err := rows.Scan(&sequence); err != nil {
+		var r TrackedMigration
+		var target string
+		if err := rows.Scan(&r.Sequence, &r.Filename, &r.Digest, &r.Status, &target); err != nil {
 			return nil, err
 		}
-		names = append(names, strconv.FormatInt(sequence, 10))
+		if target == "" {
+			return nil, fmt.Errorf("unscoped %s migration ledger for app %q; use a fresh database and ledger", database, app)
+		}
+		out = append(out, r)
 	}
-	return names, rows.Err()
+	return out, rows.Err()
 }
 
-func (t *Tracker) RecordApplied(ctx context.Context, app string, database string, sequence int64) error {
-	if t == nil || t.db == nil {
-		return fmt.Errorf("postgres tracker: db is nil")
-	}
-
-	_, err := t.db.ExecContext(ctx,
-		`INSERT INTO public.migrations (app, database, sequence) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-		app, database, sequence,
-	)
+// RecordState is called under the target's advisory lock, after identity validation.
+func (t *Tracker) RecordState(ctx context.Context, app, database, schema string, r TrackedMigration) error {
+	_, err := t.executor().ExecContext(ctx, `INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, status)
+ VALUES ($1, $2, $3, $4, $5, $6, $7)
+ ON CONFLICT (app, database, schema, sequence) DO UPDATE SET status = EXCLUDED.status`,
+		app, database, schema, r.Sequence, r.Filename, r.Digest, r.Status)
 	return err
 }
 

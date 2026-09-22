@@ -10,11 +10,13 @@ package chmigrate
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,7 +32,7 @@ const clickhouseTrackerDatabase = "clickhouse"
 // Config holds configuration for ClickHouse migrations.
 type Config struct {
 	ClientAddr string // Native protocol address (e.g., clickhouse:9000)
-	Database   string
+	Database   string // Required explicit target; also identifies the ledger scope
 	Username   string
 	Password   string
 	App        string
@@ -77,9 +79,19 @@ func New(config *Config) *ClickHouse {
 	}
 }
 
-func (c *ClickHouse) requireTracker(ctx context.Context) error {
+func (c *ClickHouse) validateConfig() error {
+	if strings.TrimSpace(c.db) == "" {
+		return fmt.Errorf("clickhouse migrations require an explicit Database")
+	}
 	if c.tracker == nil {
 		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking")
+	}
+	return nil
+}
+
+func (c *ClickHouse) requireTracker(ctx context.Context) error {
+	if err := c.validateConfig(); err != nil {
+		return err
 	}
 	if err := c.tracker.Setup(ctx); err != nil {
 		return fmt.Errorf("clickhouse migrations require PostgresDB for tracking/locking: %w", err)
@@ -124,26 +136,29 @@ func (c *ClickHouse) Applied(ctx context.Context) ([]string, error) {
 	if err := c.requireTracker(ctx); err != nil {
 		return nil, err
 	}
-	return c.tracker.Applied(ctx, c.app, clickhouseTrackerDatabase)
+	records, err := c.records(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var applied []string
+	for _, r := range records {
+		if r.Status == "applied" {
+			applied = append(applied, strconv.FormatInt(r.Sequence, 10))
+		}
+	}
+	return applied, nil
 }
 
-// lock acquires a global database-wide migration lock.
-// All apps share the same lock to prevent concurrent ClickHouse migrations.
-// This is necessary because ON CLUSTER operations modify distributed DDL queue across all nodes.
+// lock serializes the target database across apps and connection aliases.
+// One Postgres ledger owns one logical ClickHouse deployment.
 func (c *ClickHouse) lock(ctx context.Context) error {
-	if err := c.requireTracker(ctx); err != nil {
-		return err
-	}
-	key := coremigrate.AdvisoryLockKey("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
+	key := coremigrate.AdvisoryLockKey("clickhouse:migrations:" + c.db)
 	return c.tracker.Lock(ctx, key)
 }
 
 // unlock releases the global lock
 func (c *ClickHouse) unlock(ctx context.Context) error {
-	if err := c.requireTracker(ctx); err != nil {
-		return err
-	}
-	key := coremigrate.AdvisoryLockKey("clickhouse:migrations:" + c.addr + ":" + c.db + ":" + c.cluster)
+	key := coremigrate.AdvisoryLockKey("clickhouse:migrations:" + c.db)
 	return c.tracker.Unlock(ctx, key)
 }
 
@@ -345,17 +360,19 @@ func (c *ClickHouse) applyOne(ctx context.Context, m migratekit.Migration) error
 		content = strings.ReplaceAll(content, "${ON_CLUSTER}", "")
 	}
 
+	record := coremigrate.TrackedMigration{Sequence: sequence, Filename: m.Name, Digest: contentDigest(m.Content), Status: "running"}
+	if err := c.tracker.RecordState(ctx, c.app, clickhouseTrackerDatabase, c.db, record); err != nil {
+		return err
+	}
 	if err := c.execStatements(ctx, m.Name, content); err != nil {
 		return err
 	}
 
-	if err := c.requireTracker(ctx); err != nil {
-		return err
-	}
-	return c.tracker.RecordApplied(ctx, c.app, clickhouseTrackerDatabase, sequence)
+	record.Status = "applied"
+	return c.tracker.RecordState(ctx, c.app, clickhouseTrackerDatabase, c.db, record)
 }
 
-// ApplyMigrations applies all unapplied migrations (only locks if needed)
+// ApplyMigrations validates identity and applies pending migrations under the target lock.
 // Tracking tables are initialized automatically before proceeding.
 func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migratekit.Migration) (err error) {
 	if err := migratekit.ValidateSequences(migrations); err != nil {
@@ -363,21 +380,6 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migrateki
 	}
 	if err := c.requireTracker(ctx); err != nil {
 		return err
-	}
-
-	applied, err := c.Applied(ctx)
-	if err != nil {
-		return err
-	}
-
-	var toApply []migratekit.Migration
-	for _, mig := range migrations {
-		if !coremigrate.Contains(applied, migratekit.Prefix(mig.Name)) {
-			toApply = append(toApply, mig)
-		}
-	}
-	if len(toApply) == 0 {
-		return nil
 	}
 
 	if err := c.lock(ctx); err != nil {
@@ -389,19 +391,10 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migrateki
 		}
 	}()
 
-	// Double-check under lock in case another process applied some since our first read
-	applied, err = c.Applied(ctx)
+	// Validate every recorded identity before any ClickHouse statement or ledger write.
+	toApply, err := c.pending(ctx, migrations)
 	if err != nil {
 		return err
-	}
-	toApply = toApply[:0]
-	for _, mig := range migrations {
-		if !coremigrate.Contains(applied, migratekit.Prefix(mig.Name)) {
-			toApply = append(toApply, mig)
-		}
-	}
-	if len(toApply) == 0 {
-		return nil
 	}
 
 	for _, mig := range toApply {
@@ -420,30 +413,65 @@ func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []migrat
 	if err := migratekit.ValidateSequences(migrations); err != nil {
 		return err
 	}
-	applied, err := c.Applied(ctx)
+	pending, err := c.pending(ctx, migrations)
 	if err != nil {
-		return fmt.Errorf("failed to get applied migrations: %w", err)
+		return err
 	}
-
-	// Convert applied list to map for quick lookup
-	appliedMap := make(map[string]bool)
-	for _, name := range applied {
-		appliedMap[name] = true
+	if len(pending) > 0 {
+		return fmt.Errorf("%d pending or incomplete migrations must be applied: %v", len(pending), pendingNames(pending))
 	}
+	return nil
+}
 
-	// Check which migrations are pending
-	var pending []string
-	for _, mig := range migrations {
-		if !appliedMap[migratekit.Prefix(mig.Name)] {
-			pending = append(pending, mig.Name)
+func contentDigest(content string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(content))) }
+
+func (c *ClickHouse) records(ctx context.Context) ([]coremigrate.TrackedMigration, error) {
+	if err := c.validateConfig(); err != nil {
+		return nil, err
+	}
+	return c.tracker.Records(ctx, c.app, clickhouseTrackerDatabase, c.db)
+}
+
+func (c *ClickHouse) pending(ctx context.Context, migrations []migratekit.Migration) ([]migratekit.Migration, error) {
+	records, err := c.records(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bySequence := make(map[int64]migratekit.Migration, len(migrations))
+	for _, m := range migrations {
+		sequence, _ := migratekit.Sequence(m.Name)
+		bySequence[sequence] = m
+	}
+	applied := make(map[int64]bool, len(records))
+	for _, r := range records {
+		m, ok := bySequence[r.Sequence]
+		if !ok {
+			return nil, fmt.Errorf("clickhouse database %q: recorded migration %d (%s) missing from source", c.db, r.Sequence, r.Filename)
+		}
+		if r.Filename != m.Name || r.Digest != contentDigest(m.Content) {
+			return nil, fmt.Errorf("clickhouse database %q: migration %d identity mismatch (filename or content digest)", c.db, r.Sequence)
+		}
+		if r.Status != "applied" && r.Status != "running" {
+			return nil, fmt.Errorf("clickhouse migration %s has unsupported status %q", m.Name, r.Status)
+		}
+		applied[r.Sequence] = r.Status == "applied"
+	}
+	var pending []migratekit.Migration
+	for _, m := range migrations {
+		sequence, _ := migratekit.Sequence(m.Name)
+		if !applied[sequence] {
+			pending = append(pending, m)
 		}
 	}
+	return pending, nil
+}
 
-	if len(pending) > 0 {
-		return fmt.Errorf("%d pending migrations must be applied: %v", len(pending), pending)
+func pendingNames(migrations []migratekit.Migration) []string {
+	names := make([]string, len(migrations))
+	for i, m := range migrations {
+		names[i] = m.Name
 	}
-
-	return nil
+	return names
 }
 
 // Close closes the connection
