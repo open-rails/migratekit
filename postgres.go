@@ -52,6 +52,11 @@ type Postgres struct {
 	strictOrdering bool
 	// warn is the sink for warning-severity discrepancies. See WithWarnFunc.
 	warn func(Discrepancy)
+
+	// conversions, render and strictIntegrity: see conversion.go.
+	conversions     []Conversion
+	render          Render
+	strictIntegrity bool
 }
 
 // NewPostgres creates a Postgres migrator
@@ -316,6 +321,9 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 		return err
 	}
 	if err := p.ensureSetup(ctx); err != nil {
+		return err
+	}
+	if err := p.reconcile(ctx, migrations); err != nil {
 		return err
 	}
 

@@ -2,8 +2,10 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.0.5. It retains the fresh v1.0.4 public API and
-numeric ledger, with no aliases for removed methods or legacy database
+The recommended release is v1.10.0: v1.0.5 plus application-declared
+conversions from retired chains and opt-in strict integrity. v1.1.x through
+v1.9.x are retracted pre-launch strings, so the next minor after them is v1.10.
+v1.0.5 retains the fresh v1.0.4 public API and numeric ledger, with no aliases for removed methods or legacy database
 conversion. It fixes ClickHouse target-database scoping and filename/content
 identity validation. ClickHouse needs a fresh target-scoped ledger; old unscoped
 rows are rejected without adoption.
@@ -25,7 +27,7 @@ v1.0.5 is a later release. This is the
 [Go module self-retraction mechanism](https://go.dev/ref/mod#go-mod-file-retract),
 not a second supported release.
 
-Normal `@latest` and `@v1` queries must resolve to v1.0.5. Existing consumers must
+Normal `@latest` and `@v1` queries must resolve to the recommended release. Existing consumers must
 also replace every direct or transitive requirement on a retired version:
 retraction does not override requirements already in a module graph. Do not use
 `replace`, `exclude`, or disabled checksum verification to force the reset.
