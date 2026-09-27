@@ -4,9 +4,10 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.0.5 is the recommended v1 release.** It includes the fresh v1.0.4 API
-baseline and corrects ClickHouse target-database scoping and migration identity
-validation. The baseline replaced the retired pre-launch public API and database
+**v1.10.0 is the recommended v1 release.** It adds verified conversions from
+retired chains and opt-in strict integrity (see [Conversions](#conversions)) to
+v1.0.5, which includes the fresh v1.0.4 API baseline and corrects ClickHouse
+target-database scoping and migration identity validation. The baseline replaced the retired pre-launch public API and database
 contracts; there are no compatibility aliases or legacy-ledger conversions.
 Reset pre-launch application databases before adoption. ClickHouse requires a
 fresh, target-scoped ledger; old unscoped rows are rejected without conversion.
@@ -22,7 +23,7 @@ excludes the retired versions from normal version queries; see
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit@v1.0.5
+go get github.com/open-rails/migratekit@v1.10.0
 ```
 
 ## Usage
@@ -221,6 +222,10 @@ Unexported helpers and exact error-message wording are implementation details.
 | `(*Postgres) Applied(ctx) ([]string, error)` | Recorded sequences in decimal form, numerically ordered for this app, `database='postgres'`. |
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | Refuse a pending migration that sorts below one already applied. Opt-in. |
+| `(*Postgres) WithStrictIntegrity() *Postgres` | An edited applied migration no longer just warns: the live schema is compared with a fresh build of the applied migrations. Equal: digests re-stamped (audit verb `verify-content`). Different: refuse with the migration, the schema diff and the resolution. Needs `WithSchema`. Opt-in. |
+| `(*Postgres) WithConversions(...Conversion) *Postgres` | Declares retired chains this chain converts from. See [Conversions](#conversions). |
+| `(*Postgres) WithRender(Render) *Postgres` | How the current chain renders for another schema. Needed only for hard-qualified migrations. |
+| `type Conversion struct { Name string; Retired Render; Replaces int; SQL func(schema string) (string, error); Fallback string }`, `type Render func(schema string) ([]Migration, error)`, `ErrSchemaMismatch` | Conversion declaration and its refusal error. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | Ledger keyed by tracking key, carrying the recorded filename and content digest. |
 | `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
 | `(*Postgres) Status(ctx, []Migration) (Status, error)` | Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Tracker tables are initialized automatically. |
@@ -275,13 +280,34 @@ Each migration is identified by its numeric sequence within its application,
 database driver, and configured schema. A different filename claiming an applied
 sequence is an error. Edited SQL emits a warning; comments, whitespace, and
 unquoted-identifier case are ignored by the semantic digest. Content drift does
-not block startup. `WithStrictOrdering` optionally rejects pending migrations
+not block startup unless `WithStrictIntegrity` is set. `WithStrictOrdering` optionally rejects pending migrations
 below an already-applied sequence.
 
 `Status` explains discrepancies. The CLI repair commands and their corresponding
 Go methods record the operator's reason and ledger change together in
 `public.migration_repairs`. They do not reconstruct application tables or convert
 an older ledger schema.
+
+### Conversions
+
+A chain that rebaselines leaves databases built by the old chain with a ledger
+the new tree cannot use. A `Conversion` declares the retired chain and the SQL
+that turns it into the leading `Replaces` migrations of the current chain.
+During `ApplyMigrations`, under the migration lock and in one transaction,
+migratekit converts when the ledger records exactly the retired chain (or is
+empty while the schema has its shape):
+
+1. the live schema must equal a fresh build of the retired chain;
+2. the conversion SQL runs (it may `RAISE` to refuse, e.g. on data it cannot carry);
+3. the result must equal a fresh build of the replaced migrations;
+4. the retired ledger rows are replaced, each change with an audit row (verb `convert`).
+
+Any failure rolls everything back and names the diff and the `Fallback`.
+Reference builds run the migrations in a throwaway schema inside the same
+transaction, so nothing is hard-coded and nothing persists. Schemas compare by
+behaviour: tables, columns, types, constraints (with names), indexes (not their
+names), triggers, functions, views, sequences and policies; not column order,
+comments, ownership or grants.
 
 ### Parent links and authoring checks
 
