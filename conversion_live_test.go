@@ -146,8 +146,8 @@ func TestConversionUpgradesRetiredChainThenAppliesTheRest(t *testing.T) {
 	if err := NewPostgres(db, "mk-conv-fresh").WithSchema("mk_conv_fresh").ApplyMigrations(ctx, currentChain); err != nil {
 		t.Fatal(err)
 	}
-	if d := liveFingerprint(t, db, "mk_conv_upgrade").diff(liveFingerprint(t, db, "mk_conv_fresh")); len(d) > 0 {
-		t.Fatalf("converted schema differs from fresh:\n%s", strings.Join(d, "\n"))
+	if d, err := SchemaDiff(ctx, db, "mk_conv_upgrade", "mk_conv_fresh"); err != nil || len(d) > 0 {
+		t.Fatalf("converted schema differs from fresh (%v):\n%s", err, strings.Join(d, "\n"))
 	}
 	var name string
 	if err := db.QueryRow(`SELECT name FROM mk_conv_upgrade.accounts WHERE id = 7`).Scan(&name); err != nil || name != "kept" {
@@ -316,7 +316,22 @@ func TestFingerprintIsSemantic(t *testing.T) {
 	if d := a.diff(cosmetic); len(d) > 0 {
 		t.Fatalf("cosmetic differences counted: %v", d)
 	}
+	// A pg_dump round trip reprints a varchar IN-list; the constraint is the same.
+	original := build("mk_fp_a", `CREATE TABLE m (method varchar(8) NOT NULL CHECK (method IN ('email','sms')));`)
+	restored := build("mk_fp_b", `CREATE TABLE m (method varchar(8) NOT NULL,
+	         CONSTRAINT m_method_check CHECK (((method)::text = ANY ((ARRAY['email'::character varying, 'sms'::character varying])::text[]))));`)
+	if d := original.diff(restored); len(d) > 0 {
+		t.Fatalf("dump round trip counted as a difference: %v", d)
+	}
+	// A string literal that happens to start with the schema's name is data.
+	literalA := build("mk_fp_a", `CREATE FUNCTION g() RETURNS text LANGUAGE sql AS $$ SELECT current_setting('mk_fp_a.decision', true) $$;`)
+	literalB := build("mk_fp_b", `CREATE FUNCTION g() RETURNS text LANGUAGE sql AS $$ SELECT current_setting('mk_fp_a.decision', true) $$;`)
+	if d := literalA.diff(literalB); len(d) > 0 {
+		t.Fatalf("string literal treated as a qualifier: %v", d)
+	}
+	a = build("mk_fp_a", base)
 	for name, body := range map[string]string{
+		"check values":    strings.Replace(base, "b text", "b text CHECK (b IN ('x'))", 1),
 		"nullability":     strings.Replace(base, "b text", "b text NOT NULL", 1),
 		"constraint name": strings.Replace(base, "t_a_key", "t_a_unique", 1),
 		"index columns":   strings.Replace(base, "t (b)", "t (b, a)", 1),

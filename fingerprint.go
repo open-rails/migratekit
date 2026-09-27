@@ -3,6 +3,7 @@ package migratekit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -20,6 +21,13 @@ import (
 // of sequences. Constraint and trigger names are kept: application code
 // matches on constraint names, and trigger names decide firing order.
 // Objects that belong to an extension are skipped.
+//
+// Expressions (CHECK constraints, defaults, index definitions, policies,
+// views) are compared in canonical form: printed, parsed back into a scratch
+// temp table, and printed again. The parser does not always reproduce the
+// tree it was given — a pg_dump round trip turns ARRAY['a'::varchar]::text[]
+// into ARRAY['a'::varchar::text] — so a restored database and the database it
+// was dumped from would otherwise disagree about identical constraints.
 
 type fingerprint []string
 
@@ -27,12 +35,28 @@ type fingerprint []string
 // search_path=pg_catalog so every name outside pg_catalog renders
 // schema-qualified, then replaces the schema's own name with a placeholder so
 // the same objects in two schemas compare equal.
-func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fingerprint, error) {
+func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fp fingerprint, err error) {
+	// The canonicalizers create temp objects; the savepoint takes them away.
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT migratekit_fingerprint"); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if _, rbErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT migratekit_fingerprint"); rbErr != nil {
+			err = errors.Join(err, rbErr)
+			return
+		}
+		if _, relErr := tx.ExecContext(ctx, "RELEASE SAVEPOINT migratekit_fingerprint"); relErr != nil {
+			err = errors.Join(err, relErr)
+		}
+	}()
 	if _, err := tx.ExecContext(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
 		return nil, fmt.Errorf("fingerprint %s: %w", schema, err)
 	}
+	if _, err := tx.ExecContext(ctx, canonicalizers); err != nil {
+		return nil, fmt.Errorf("fingerprint %s: install canonicalizers: %w", schema, err)
+	}
 	var oid uint32
-	err := tx.QueryRowContext(ctx, `SELECT oid FROM pg_namespace WHERE nspname = $1`, schema).Scan(&oid)
+	err = tx.QueryRowContext(ctx, `SELECT oid FROM pg_namespace WHERE nspname = $1`, schema).Scan(&oid)
 	if err == sql.ErrNoRows {
 		return fingerprint{}, nil
 	}
@@ -81,6 +105,70 @@ func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fingerpr
 	return fingerprint(lines), nil
 }
 
+// canonicalizers print an expression, parse it back against a temp copy of
+// its table, and print it again. They return NULL when an expression cannot be
+// re-created in isolation, and the caller falls back to the stored form.
+const canonicalizers = `
+CREATE FUNCTION pg_temp.mk_canon_check(tbl oid, def text) RETURNS text LANGUAGE plpgsql AS $mk$
+DECLARE out text;
+BEGIN
+  EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
+  EXECUTE format('ALTER TABLE pg_temp.mk_canon_t ADD CONSTRAINT mk_canon_c %s', def);
+  SELECT pg_get_constraintdef(c.oid, true) INTO out FROM pg_constraint c
+   WHERE c.conrelid = 'pg_temp.mk_canon_t'::regclass AND c.conname = 'mk_canon_c';
+  DROP TABLE pg_temp.mk_canon_t;
+  RETURN out;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END $mk$;
+CREATE FUNCTION pg_temp.mk_canon_default(tbl oid, col name, expr text) RETURNS text LANGUAGE plpgsql AS $mk$
+DECLARE out text;
+BEGIN
+  EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
+  EXECUTE format('ALTER TABLE pg_temp.mk_canon_t ALTER COLUMN %I SET DEFAULT %s', col, expr);
+  SELECT pg_get_expr(d.adbin, d.adrelid) INTO out FROM pg_attrdef d
+    JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+   WHERE d.adrelid = 'pg_temp.mk_canon_t'::regclass AND a.attname = col;
+  DROP TABLE pg_temp.mk_canon_t;
+  RETURN out;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END $mk$;
+CREATE FUNCTION pg_temp.mk_canon_index(tbl oid, def text) RETURNS text LANGUAGE plpgsql AS $mk$
+DECLARE out text;
+BEGIN
+  EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
+  EXECUTE regexp_replace(def, '^(CREATE (UNIQUE )?INDEX )\S+ ON (ONLY )?\S+', '\1mk_canon_i ON pg_temp.mk_canon_t');
+  out := pg_get_indexdef('pg_temp.mk_canon_i'::regclass);
+  DROP TABLE pg_temp.mk_canon_t;
+  RETURN out;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END $mk$;
+CREATE FUNCTION pg_temp.mk_canon_policy(tbl oid, expr text, kind text) RETURNS text LANGUAGE plpgsql AS $mk$
+DECLARE out text;
+BEGIN
+  IF expr IS NULL THEN RETURN NULL; END IF;
+  EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
+  IF kind = 'using' THEN
+    EXECUTE format('CREATE POLICY mk_canon_p ON pg_temp.mk_canon_t USING (%s)', expr);
+    SELECT pg_get_expr(p.polqual, p.polrelid) INTO out FROM pg_policy p WHERE p.polrelid = 'pg_temp.mk_canon_t'::regclass;
+  ELSE
+    EXECUTE format('CREATE POLICY mk_canon_p ON pg_temp.mk_canon_t WITH CHECK (%s)', expr);
+    SELECT pg_get_expr(p.polwithcheck, p.polrelid) INTO out FROM pg_policy p WHERE p.polrelid = 'pg_temp.mk_canon_t'::regclass;
+  END IF;
+  DROP TABLE pg_temp.mk_canon_t;
+  RETURN out;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END $mk$;
+CREATE FUNCTION pg_temp.mk_canon_view(def text) RETURNS text LANGUAGE plpgsql AS $mk$
+DECLARE out text;
+BEGIN
+  EXECUTE 'CREATE TEMP VIEW mk_canon_v AS ' || def;
+  out := pg_get_viewdef('pg_temp.mk_canon_v'::regclass, true);
+  DROP VIEW pg_temp.mk_canon_v;
+  RETURN out;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END $mk$;
+`
+
 type fingerprintQuery struct {
 	kind string
 	sql  string
@@ -92,7 +180,9 @@ const notExtensionMember = `NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid 
 
 func extFilter(expr string) string { return fmt.Sprintf(notExtensionMember, expr) }
 
-var indexName = regexp.MustCompile(`^(CREATE (?:UNIQUE )?INDEX )\S+( ON )`)
+// indexHead is "CREATE [UNIQUE] INDEX <name> ON [ONLY] <table> ": the name is
+// cosmetic and the table is already a field of the line.
+var indexHead = regexp.MustCompile(`^CREATE (UNIQUE )?INDEX \S+ ON (?:ONLY )?\S+ `)
 
 var fingerprintQueries = []fingerprintQuery{
 	{kind: "relation", sql: `
@@ -105,7 +195,10 @@ var fingerprintQueries = []fingerprintQuery{
 		   AND ` + extFilter("c.oid")},
 	{kind: "column", sql: `
 		SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
-		       a.attnotnull::text, pg_get_expr(ad.adbin, ad.adrelid),
+		       a.attnotnull::text,
+		       CASE WHEN ad.adbin IS NOT NULL AND a.attgenerated = '' AND c.relkind IN ('r','p','f')
+		            THEN COALESCE(pg_temp.mk_canon_default(c.oid, a.attname, pg_get_expr(ad.adbin, ad.adrelid)), pg_get_expr(ad.adbin, ad.adrelid))
+		            ELSE pg_get_expr(ad.adbin, ad.adrelid) END,
 		       a.attidentity::text, a.attgenerated::text,
 		       CASE WHEN a.attcollation <> t.typcollation THEN co.collname END
 		  FROM pg_attribute a
@@ -118,13 +211,15 @@ var fingerprintQueries = []fingerprintQuery{
 		   AND ` + extFilter("c.oid")},
 	{kind: "constraint", sql: `
 		SELECT COALESCE(cl.relname, ty.typname), con.conname, con.contype::text,
-		       pg_get_constraintdef(con.oid, true)
+		       CASE WHEN con.contype = 'c' AND con.conrelid <> 0
+		            THEN COALESCE(pg_temp.mk_canon_check(con.conrelid, pg_get_constraintdef(con.oid)), pg_get_constraintdef(con.oid, true))
+		            ELSE pg_get_constraintdef(con.oid, true) END
 		  FROM pg_constraint con
 		  LEFT JOIN pg_class cl ON cl.oid = con.conrelid
 		  LEFT JOIN pg_type ty ON ty.oid = con.contypid
 		 WHERE con.connamespace = $1 AND ` + extFilter("con.oid")},
 	{kind: "index", sql: `
-		SELECT tc.relname, pg_get_indexdef(i.indexrelid)
+		SELECT tc.relname, COALESCE(pg_temp.mk_canon_index(i.indrelid, pg_get_indexdef(i.indexrelid)), pg_get_indexdef(i.indexrelid))
 		  FROM pg_index i
 		  JOIN pg_class ic ON ic.oid = i.indexrelid
 		  JOIN pg_class tc ON tc.oid = i.indrelid
@@ -132,7 +227,7 @@ var fingerprintQueries = []fingerprintQuery{
 		   AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid AND k.contype IN ('p','u','x'))
 		   AND ` + extFilter("i.indexrelid"),
 		post: func(f []string) []string {
-			f[1] = indexName.ReplaceAllString(f[1], "${1}_${2}")
+			f[1] = indexHead.ReplaceAllString(f[1], "${1}INDEX ")
 			return f
 		}},
 	{kind: "trigger", sql: `
@@ -145,7 +240,9 @@ var fingerprintQueries = []fingerprintQuery{
 		  FROM pg_proc p
 		 WHERE p.pronamespace = $1 AND ` + extFilter("p.oid")},
 	{kind: "view", sql: `
-		SELECT c.relname, pg_get_viewdef(c.oid, true)
+		SELECT c.relname, CASE WHEN c.relkind = 'v'
+		            THEN COALESCE(pg_temp.mk_canon_view(pg_get_viewdef(c.oid)), pg_get_viewdef(c.oid, true))
+		            ELSE pg_get_viewdef(c.oid, true) END
 		  FROM pg_class c
 		 WHERE c.relnamespace = $1 AND c.relkind IN ('v','m') AND ` + extFilter("c.oid")},
 	{kind: "sequence", sql: `
@@ -172,7 +269,8 @@ var fingerprintQueries = []fingerprintQuery{
 		SELECT c.relname, pol.polname, pol.polcmd::text, pol.polpermissive::text,
 		       (SELECT string_agg(n, ',' ORDER BY n)
 		          FROM (SELECT CASE WHEN r = 0 THEN 'public' ELSE pg_get_userbyid(r)::text END AS n FROM unnest(pol.polroles) r) roles),
-		       pg_get_expr(pol.polqual, pol.polrelid), pg_get_expr(pol.polwithcheck, pol.polrelid)
+		       COALESCE(pg_temp.mk_canon_policy(pol.polrelid, pg_get_expr(pol.polqual, pol.polrelid), 'using'), pg_get_expr(pol.polqual, pol.polrelid)),
+		       COALESCE(pg_temp.mk_canon_policy(pol.polrelid, pg_get_expr(pol.polwithcheck, pol.polrelid), 'check'), pg_get_expr(pol.polwithcheck, pol.polrelid))
 		  FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid
 		 WHERE c.relnamespace = $1`},
 	{kind: "rule", sql: `
@@ -195,8 +293,11 @@ const schemaPlaceholder = "<schema>"
 func newSchemaNormalizer(schema string) schemaNormalizer {
 	q := regexp.QuoteMeta(schema)
 	return schemaNormalizer{
-		qualified:  regexp.MustCompile(`(^|[^A-Za-z0-9_$."])(?:"` + q + `"|` + q + `)\.`),
-		regclass:   regexp.MustCompile(`'` + q + `\.`),
+		// A qualifier is never inside a string literal, except in a
+		// 'schema.object'::regclass (or other reg*) constant: 'billing.decision'
+		// as a GUC name is data, not the billing schema.
+		qualified:  regexp.MustCompile(`(^|[^A-Za-z0-9_$."'])(?:"` + q + `"|` + q + `)\.`),
+		regclass:   regexp.MustCompile(`'` + q + `\.([^']*)'::reg`),
 		searchPath: regexp.MustCompile(`(?im)search_path\s*(?:TO|=)[^\n;]*`),
 		entry:      regexp.MustCompile(`(^|[^A-Za-z0-9_$])(?:'` + q + `'|"` + q + `"|` + q + `)([^A-Za-z0-9_$]|$)`),
 	}
@@ -207,7 +308,7 @@ func (n schemaNormalizer) apply(s string) string {
 		return s
 	}
 	s = n.qualified.ReplaceAllString(s, "${1}"+schemaPlaceholder+".")
-	s = n.regclass.ReplaceAllString(s, "'"+schemaPlaceholder+".")
+	s = n.regclass.ReplaceAllString(s, "'"+schemaPlaceholder+".${1}'::reg")
 	return n.searchPath.ReplaceAllStringFunc(s, func(clause string) string {
 		// Entries are separated by ", ", so each match consumes at most one
 		// neighbour; two passes cover adjacent entries.
@@ -270,4 +371,25 @@ func truncateLine(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// SchemaDiff compares two schemas of one database by behaviour, with the same
+// rules conversions and strict integrity use, and lists every difference:
+// "- " lines exist only in schema, "+ " lines only in reference. It reads the
+// catalog in a transaction it rolls back, so it changes nothing.
+func SchemaDiff(ctx context.Context, db *sql.DB, schema, reference string) ([]string, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	a, err := schemaFingerprint(ctx, tx, schema)
+	if err != nil {
+		return nil, err
+	}
+	b, err := schemaFingerprint(ctx, tx, reference)
+	if err != nil {
+		return nil, err
+	}
+	return a.diff(b), nil
 }

@@ -224,6 +224,7 @@ Unexported helpers and exact error-message wording are implementation details.
 | `(*Postgres) WithStrictOrdering() *Postgres` | Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) WithStrictIntegrity() *Postgres` | An edited applied migration no longer just warns: the live schema is compared with a fresh build of the applied migrations. Equal: digests re-stamped (audit verb `verify-content`). Different: refuse with the migration, the schema diff and the resolution. Needs `WithSchema`. Opt-in. |
 | `(*Postgres) WithConversions(...Conversion) *Postgres` | Declares retired chains this chain converts from. See [Conversions](#conversions). |
+| `SchemaDiff(ctx, *sql.DB, schema, reference string) ([]string, error)` | Read-only comparison of two schemas by behaviour, with the rules conversions use. |
 | `(*Postgres) WithRender(Render) *Postgres` | How the current chain renders for another schema. Needed only for hard-qualified migrations. |
 | `type Conversion struct { Name string; Retired Render; Replaces int; SQL func(schema string) (string, error); Fallback string }`, `type Render func(schema string) ([]Migration, error)`, `ErrSchemaMismatch` | Conversion declaration and its refusal error. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | Ledger keyed by tracking key, carrying the recorded filename and content digest. |
