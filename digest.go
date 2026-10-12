@@ -12,7 +12,7 @@ import (
 // dollar-quoted bodies remain byte-exact because whitespace inside them can be
 // executable data.
 func SemanticContentDigest(content string) string {
-	tokens := sqlTokens(canonicalBody(content))
+	tokens := sqlTokens(content)
 	hash := sha256.New()
 	hash.Write([]byte("migratekit-postgresql-tokens-v1\x00"))
 	for _, token := range tokens {

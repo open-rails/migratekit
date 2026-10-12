@@ -15,7 +15,7 @@ func TestNoTransactionDirective(t *testing.T) {
 		{name: "alone", body: "-- migratekit:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (c);\n", want: true},
 		{
 			name: "after other header comments",
-			body: "-- parent: 4 sha256:x\n-- why: the table is live\n-- migratekit:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (c);\n",
+			body: "-- owner: search lane\n-- why: the table is live\n-- migratekit:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (c);\n",
 			want: true,
 		},
 		{name: "blank lines in the block", body: "-- one\n\n-- migratekit:no-transaction\nSELECT 1;\n", want: true},

@@ -54,10 +54,8 @@ COMMANDS
                                 the next boot runs it again — idempotent migrations only)
 
 DATABASE-FREE COMMANDS (no -dsn, no -app; safe and intended for CI)
-  check                         lint the directory: numbering, parent links, and the
-                                repair-totality rule
-  relink                        rewrite each parent line to the file that actually
-                                precedes it — the one-command fix after a renumber
+  check                         lint the directory: numbering and the repair-totality
+                                rule
 
 COMMON FLAGS
   -dsn string       Postgres DSN (default $DATABASE_URL)
@@ -79,11 +77,6 @@ APPLY FLAGS
 RESOLVE FLAGS
   --applied   the DDL landed; mark the row applied
   --rerun     the DDL did not land (or you undid it); drop the row
-
-CHECK / RELINK FLAGS
-  --require-links   a migration with no "-- parent:" line is an error (check)
-  --check           report what relink WOULD rewrite and exit 1 if anything (relink)
-  --from <number>   relink only migrations at or above this number
 
 Repairs refuse to run in CI. They rewrite one database's ledger after a human
 has read the diff; a pipeline that needs one has a chain problem to fix in the
@@ -112,9 +105,6 @@ type opts struct {
 
 	resolveApplied bool
 	resolveRerun   bool
-	requireLinks   bool
-	checkOnly      bool
-	from           string
 }
 
 type multiFlag []string
@@ -174,9 +164,6 @@ func run(args []string) error {
 	fs.BoolVar(&o.resolveApplied, "applied", false, "resolve a dirty migration as applied")
 	fs.BoolVar(&o.resolveRerun, "rerun", false, "resolve a dirty migration by dropping its ledger row")
 	fs.BoolVar(&o.schemaVerified, "schema-verified", false, "assert the schema already holds everything the tree's migrations build")
-	fs.BoolVar(&o.requireLinks, "require-links", false, "a migration with no parent link is an error")
-	fs.BoolVar(&o.checkOnly, "check", false, "report what relink would rewrite; write nothing")
-	fs.StringVar(&o.from, "from", "", "relink only migrations at or above this number")
 
 	// Positional arguments may precede flags (`repair adopt 42 --reason x`).
 	var positional []string
@@ -192,13 +179,9 @@ func run(args []string) error {
 		rest = rest[1:]
 	}
 
-	// `check` and `relink` read and write FILES. They take no database, which
-	// is what makes them the CI gate and the authoring fix respectively.
-	switch command {
-	case "check":
+	// `check` reads FILES only; taking no database makes it the CI gate.
+	if command == "check" {
 		return runCheck(o)
-	case "relink":
-		return runRelink(o)
 	}
 
 	if o.app == "" {
@@ -347,13 +330,21 @@ func run(args []string) error {
 	return fmt.Errorf("unknown command %q; run `migratekit help`", command)
 }
 
-// runCheck is the merge-boundary gate: numbering, parent links and the
-// repair-totality rule, all from file content alone.
+// runCheck is the merge-boundary gate: numbering and the repair-totality rule,
+// both from file content alone.
 func runCheck(o opts) error {
 	fsys := os.DirFS(o.dir)
 	var failures []string
-	if err := migratekit.CheckChainFS(fsys, ".", o.requireLinks); err != nil {
+	if migrations, err := migratekit.Load(fsys, "."); err != nil {
 		failures = append(failures, err.Error())
+	} else {
+		names := make([]string, 0, len(migrations))
+		for _, m := range migrations {
+			names = append(names, m.Name)
+		}
+		if err := migratekit.CheckChain(names); err != nil {
+			failures = append(failures, err.Error())
+		}
 	}
 	if err := migratekit.CheckRepairTotality(fsys, "."); err != nil {
 		failures = append(failures, err.Error())
@@ -362,39 +353,6 @@ func runCheck(o opts) error {
 		return fmt.Errorf("migratekit check failed in %s:\n\n%s", o.dir, strings.Join(failures, "\n\n"))
 	}
 	fmt.Printf("migratekit check: %s is clean\n", o.dir)
-	return nil
-}
-
-// runRelink rewrites parent lines. It is an AUTHORING verb: no reason, no audit
-// row and no CI refusal, because it changes files (which git already records)
-// rather than a ledger. `--check` is the CI form.
-func runRelink(o opts) error {
-	changes, err := migratekit.Relink(o.dir, migratekit.RelinkOptions{
-		DryRun: o.checkOnly || o.dryRun,
-		From:   o.from,
-	})
-	if err != nil {
-		return err
-	}
-	if len(changes) == 0 {
-		fmt.Printf("migratekit relink: %s is already linked\n", o.dir)
-		return nil
-	}
-	for _, c := range changes {
-		from := c.From
-		if from == "" {
-			from = "(no parent line)"
-		}
-		fmt.Printf("%s\n  - %s\n  + %s\n", c.File, from, c.To)
-	}
-	if o.checkOnly {
-		return fmt.Errorf("%d parent line(s) are stale; run `migratekit relink -dir %s`", len(changes), o.dir)
-	}
-	if o.dryRun {
-		fmt.Printf("[dry-run] %d parent line(s) would be rewritten\n", len(changes))
-		return nil
-	}
-	fmt.Printf("%d parent line(s) rewritten\n", len(changes))
 	return nil
 }
 

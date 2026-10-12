@@ -60,7 +60,7 @@ func Sequence(name string) (int64, error) {
 			return 0, fmt.Errorf("migration %q requires an unsigned decimal sequence", name)
 		}
 	}
-	sequence, err := strconv.ParseInt(normalizeNumber(prefix), 10, 64)
+	sequence, err := strconv.ParseInt(prefix, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("migration %q has a sequence outside the BIGINT range: %w", name, err)
 	}
