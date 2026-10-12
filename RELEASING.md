@@ -2,7 +2,9 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.11.0: v1.10.0 without `-- parent:` header links.
+The recommended release is v1.11.1: v1.11.0 with ClickHouse content drift as a
+warning and semantic-digest back-stamping. v1.11.0 is v1.10.0 without
+`-- parent:` header links.
 v1.10.0 is v1.0.5 plus application-declared conversions from retired chains and
 opt-in strict integrity. v1.1.x through
 v1.9.x are retracted pre-launch strings, so the next minor after them is v1.10.

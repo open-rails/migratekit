@@ -35,8 +35,8 @@ func (t *Tracker) Setup(ctx context.Context) error {
 
 // TrackedMigration is the identity and completion state of a non-Postgres migration.
 type TrackedMigration struct {
-	Sequence                 int64
-	Filename, Digest, Status string
+	Sequence                                 int64
+	Filename, Digest, SemanticDigest, Status string
 }
 
 // executor uses the pinned lock session so even a one-connection pool can migrate.
@@ -54,7 +54,7 @@ func (t *Tracker) executor() interface {
 
 // Records reads only. Empty-schema rows are refused because their target is unknown.
 func (t *Tracker) Records(ctx context.Context, app, database, schema string) ([]TrackedMigration, error) {
-	rows, err := t.executor().QueryContext(ctx, `SELECT sequence, COALESCE(filename, ''), COALESCE(content_sha256, ''), status, schema
+	rows, err := t.executor().QueryContext(ctx, `SELECT sequence, COALESCE(filename, ''), COALESCE(content_sha256, ''), COALESCE(semantic_sha256, ''), status, schema
  FROM public.migrations WHERE app = $1 AND database = $2 AND (schema = $3 OR schema = '') ORDER BY sequence`, app, database, schema)
 	if err != nil {
 		return nil, err
@@ -64,7 +64,7 @@ func (t *Tracker) Records(ctx context.Context, app, database, schema string) ([]
 	for rows.Next() {
 		var r TrackedMigration
 		var target string
-		if err := rows.Scan(&r.Sequence, &r.Filename, &r.Digest, &r.Status, &target); err != nil {
+		if err := rows.Scan(&r.Sequence, &r.Filename, &r.Digest, &r.SemanticDigest, &r.Status, &target); err != nil {
 			return nil, err
 		}
 		if target == "" {
@@ -77,10 +77,18 @@ func (t *Tracker) Records(ctx context.Context, app, database, schema string) ([]
 
 // RecordState is called under the target's advisory lock, after identity validation.
 func (t *Tracker) RecordState(ctx context.Context, app, database, schema string, r TrackedMigration) error {
-	_, err := t.executor().ExecContext(ctx, `INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, status)
- VALUES ($1, $2, $3, $4, $5, $6, $7)
+	_, err := t.executor().ExecContext(ctx, `INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256, status)
+ VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8)
  ON CONFLICT (app, database, schema, sequence) DO UPDATE SET status = EXCLUDED.status`,
-		app, database, schema, r.Sequence, r.Filename, r.Digest, r.Status)
+		app, database, schema, r.Sequence, r.Filename, r.Digest, r.SemanticDigest, r.Status)
+	return err
+}
+
+// StampSemantic fills a missing semantic digest on a row whose exact digest still matches.
+func (t *Tracker) StampSemantic(ctx context.Context, app, database, schema string, r TrackedMigration) error {
+	_, err := t.executor().ExecContext(ctx, `UPDATE public.migrations SET semantic_sha256 = $6
+ WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4 AND content_sha256 = $5 AND COALESCE(semantic_sha256, '') = ''`,
+		app, database, schema, r.Sequence, r.Digest, r.SemanticDigest)
 	return err
 }
 

@@ -4,7 +4,10 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.11.0 is the recommended v1 release.** It removes `-- parent:` header
+**v1.11.1 is the recommended v1 release.** It makes ClickHouse content drift a
+warning (filename stays identity), records and back-stamps semantic digests on
+both ledgers, and explains lock-table exhaustion during strict-integrity
+rebuilds. v1.11.0 removed `-- parent:` header
 links (`Load` options, `VerifyChain`, `CheckChainFS`, `Relink`, `migratekit
 relink`); existing header lines are ordinary comments. v1.10.0 added verified
 conversions from retired chains and opt-in strict integrity (see
@@ -280,7 +283,8 @@ Each migration is identified by its numeric sequence within its application,
 database driver, and configured schema. A different filename claiming an applied
 sequence is an error. Edited SQL emits a warning; comments, whitespace, and
 unquoted-identifier case are ignored by the semantic digest. Content drift does
-not block startup unless `WithStrictIntegrity` is set. `WithStrictOrdering` optionally rejects pending migrations
+not block startup unless `WithStrictIntegrity` is set. Apply back-stamps the
+semantic digest onto older rows whose bytes still match. `WithStrictOrdering` optionally rejects pending migrations
 below an already-applied sequence.
 
 `Status` explains discrepancies. The CLI repair commands and their corresponding
@@ -505,15 +509,17 @@ same database name must use separate Postgres ledgers. Locks serialize all apps
 for a target database, including connections through different aliases.
 
 Before applying any DDL, the complete supplied migration set must match every
-recorded filename and exact source SHA256 in its scope. Missing files, changed
-bytes, and old rows without a target scope are errors; there is no legacy
-adoption. Digests cover source before template expansion, so deployment
-environment values are not migration identity.
+recorded filename in its scope. Missing files and old rows without a target
+scope are errors; there is no legacy adoption. As in Postgres, edited SQL in an
+applied migration only warns, and comment/whitespace edits are silent once the
+row carries a semantic digest (recorded on apply, back-stamped on the next
+apply for older rows). Digests cover source before template expansion, so
+deployment environment values are not migration identity.
 
 ClickHouse DDL is not transactional. A `running` row records identity before
 execution and becomes `applied` only after every statement succeeds. Calling
 `ApplyMigrations` again replays an identical incomplete migration from its first
 statement; migrations must be idempotent for that recovery to be safe. Changed
-source is refused even after partial execution. The read-only startup validators
-never initialize the ledger and reject pending or incomplete migrations, drift,
-and a missing ledger. They do not inspect physical ClickHouse objects.
+source of an incomplete migration is refused. The read-only startup validators
+never initialize the ledger and reject pending or incomplete migrations and a
+missing ledger. They do not inspect physical ClickHouse objects.
