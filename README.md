@@ -4,9 +4,11 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.10.0 is the recommended v1 release.** It adds verified conversions from
-retired chains and opt-in strict integrity (see [Conversions](#conversions)) to
-v1.0.5, which includes the fresh v1.0.4 API baseline and corrects ClickHouse
+**v1.11.0 is the recommended v1 release.** It removes `-- parent:` header
+links (`Load` options, `VerifyChain`, `CheckChainFS`, `Relink`, `migratekit
+relink`); existing header lines are ordinary comments. v1.10.0 added verified
+conversions from retired chains and opt-in strict integrity (see
+[Conversions](#conversions)) to v1.0.5, which includes the fresh v1.0.4 API baseline and corrects ClickHouse
 target-database scoping and migration identity validation. The baseline replaced the retired pre-launch public API and database
 contracts; there are no compatibility aliases or legacy-ledger conversions.
 Reset pre-launch application databases before adoption. ClickHouse requires a
@@ -201,14 +203,11 @@ Unexported helpers and exact error-message wording are implementation details.
 | `Sequence(name string) (int64, error)` | Validates and parses the prefix stored as `BIGINT`; accepts zero through 9223372036854775807. |
 | `ValidateSequences([]Migration) error` | Validates numeric, unique, increasing sequence numbers before database operations. Gaps are allowed. |
 | `CheckChain(names []string) error` | Validates a chain as a file listing — duplicate numbers, gaps, monotonicity — with no database. For a CI gate on the merge boundary. |
-| `ContentDigest(content string) string` | The SHA-256 of the migration body, excluding its own `-- parent:` header. |
+| `ContentDigest(content string) string` | The SHA-256 of the migration file's exact bytes. |
 | `SemanticContentDigest(content string) string` | Token-level PostgreSQL digest: ignores comments, whitespace, and unquoted-identifier case while preserving quoted/dollar-quoted content exactly. |
 | `type AppliedRecord struct { Key, Filename, Digest, SemanticDigest, Status, Error string }` | One current ledger row. `Key` is the decimal representation of the BIGINT `sequence` column. |
-| `Load(fsys fs.FS, dir string, opts ...LoadOption) ([]Migration, error)` | `LoadFromFS` plus options. `RequireParentLinks()` makes a headerless migration an error; `WithChainWarnFunc(fn)` redirects the tolerance warnings. |
-| `VerifyChain(migrations []Migration, opts ...LoadOption) error` | The parent-link check on an already-loaded chain. |
-| `CheckChainFS(fsys fs.FS, dir string, requireLinks bool) error` | The CI gate: `CheckChain`'s numbering rules plus parent-link validation, which needs the bytes and not just the names. |
+| `Load(fsys fs.FS, dir string) ([]Migration, error)` | `LoadFromFS` with a required `dir`. |
 | `CheckRepairTotality(fsys fs.FS, dir string) error` | Refuses a constraint over pre-existing data that carries no repair. Pure file analysis. |
-| `Relink(dir string, RelinkOptions) ([]RelinkChange, error)` | Rewrites parent lines to match the current order. Files only — no database, no audit, CI-safe. |
 
 ### Postgres
 
@@ -310,29 +309,7 @@ behaviour: tables, columns, types, constraints (with names), indexes (not their
 names), triggers, functions, views, sequences and policies; not column order,
 comments, ownership or grants.
 
-### Parent links and authoring checks
-
-A migration may declare its immediate predecessor on the first non-blank line:
-
-```sql
--- parent: 5 sha256:<digest-of-the-parent-body>
-```
-
-The first migration declares `-- parent: root`. `Load` verifies declared links
-while reading files, before any database access. `RequireParentLinks()` also
-rejects files without a header. Parent links must match the preceding migration's
-number and canonical content digest. The digest excludes the migration's own
-parent header.
-
-After renumbering or editing migrations, update their parent links with:
-
-```bash
-migratekit relink -dir migrations/postgres
-migratekit relink -dir migrations/postgres --check
-```
-
-`relink` edits source files only. It does not write to the database or need a
-repair reason. A squashed chain starts with a new root file.
+### Authoring checks
 
 `CheckRepairTotality` and `migratekit check` inspect constraints on pre-existing
 tables. Repair DML must precede the constraint, or the file must explain why no
@@ -340,7 +317,7 @@ repair is needed with `-- Repair: none-needed <reason>`. Tables created in the s
 migration are exempt. Unresolved statement targets require an explicit waiver.
 
 ```bash
-migratekit check -dir migrations/postgres --require-links
+migratekit check -dir migrations/postgres
 ```
 
 ### Non-transactional PostgreSQL migrations
@@ -469,12 +446,6 @@ not lexical filename order, so unpadded prefixes are safe.
 normalized prefix, two files sharing a prefix (`002_users.up.sql` +
 `002_roles.up.sql`, or `0042_x` vs `42_y`) would mean the second silently
 never runs. `LoadFromFS` returns an error instead.
-
-**Parent line:** the first non-blank line of a migration is
-`-- parent: <number> sha256:<digest-of-the-parent's-canonical-body>`, or
-`-- parent: root` for the lowest-numbered file. The whole chain is verified at load.
-Renumbering means `git mv` *and* updating that line — `migratekit relink` does both parts
-of the second half. Use `RequireParentLinks()` to require headers on every file.
 
 **Repair rule:** a migration that adds a constraint over a table that already has
 rows must carry, ABOVE the constraint, the DML that repairs the offending rows — or

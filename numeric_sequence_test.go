@@ -29,7 +29,7 @@ func TestNumericSequenceLoadAndValidate(t *testing.T) {
 	for _, name := range []string{"1_first.up.sql", "10_tenth.up.sql", "2_second.up.sql"} {
 		fsys[name] = &fstest.MapFile{Data: []byte("SELECT 1;")}
 	}
-	ms, err := Load(fsys, ".", WithChainWarnFunc(func(string) {}))
+	ms, err := Load(fsys, ".")
 	if err != nil {
 		t.Fatal(err)
 	}

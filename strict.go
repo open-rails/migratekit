@@ -66,12 +66,9 @@ type AppliedRecord struct {
 	Error string
 }
 
-// ContentDigest is the ledger's digest of a migration's CANONICAL BODY — the
-// file with its own `-- parent:` header removed (see chain.go). A headerless
-// file hashes to exactly what v1.5.0 recorded, so adding a parent line to an
-// already-applied migration changes no ledger digest.
+// ContentDigest is the ledger's sha256 of a migration's exact bytes.
 func ContentDigest(content string) string {
-	sum := sha256.Sum256([]byte(canonicalBody(content)))
+	sum := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(sum[:])
 }
 
