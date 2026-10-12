@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -360,7 +361,8 @@ func (c *ClickHouse) applyOne(ctx context.Context, m migratekit.Migration) error
 		content = strings.ReplaceAll(content, "${ON_CLUSTER}", "")
 	}
 
-	record := coremigrate.TrackedMigration{Sequence: sequence, Filename: m.Name, Digest: contentDigest(m.Content), Status: "running"}
+	record := coremigrate.TrackedMigration{Sequence: sequence, Filename: m.Name, Digest: contentDigest(m.Content),
+		SemanticDigest: migratekit.SemanticContentDigest(m.Content), Status: "running"}
 	if err := c.tracker.RecordState(ctx, c.app, clickhouseTrackerDatabase, c.db, record); err != nil {
 		return err
 	}
@@ -392,9 +394,14 @@ func (c *ClickHouse) ApplyMigrations(ctx context.Context, migrations []migrateki
 	}()
 
 	// Validate every recorded identity before any ClickHouse statement or ledger write.
-	toApply, err := c.pending(ctx, migrations)
+	toApply, stamps, err := c.pending(ctx, migrations)
 	if err != nil {
 		return err
+	}
+	for _, r := range stamps {
+		if err := c.tracker.StampSemantic(ctx, c.app, clickhouseTrackerDatabase, c.db, r); err != nil {
+			return err
+		}
 	}
 
 	for _, mig := range toApply {
@@ -413,7 +420,7 @@ func (c *ClickHouse) ValidateAllApplied(ctx context.Context, migrations []migrat
 	if err := migratekit.ValidateSequences(migrations); err != nil {
 		return err
 	}
-	pending, err := c.pending(ctx, migrations)
+	pending, _, err := c.pending(ctx, migrations)
 	if err != nil {
 		return err
 	}
@@ -432,10 +439,13 @@ func (c *ClickHouse) records(ctx context.Context) ([]coremigrate.TrackedMigratio
 	return c.tracker.Records(ctx, c.app, clickhouseTrackerDatabase, c.db)
 }
 
-func (c *ClickHouse) pending(ctx context.Context, migrations []migratekit.Migration) ([]migratekit.Migration, error) {
+// pending returns unapplied migrations plus applied rows missing a semantic
+// digest. Filename is identity; content drift on an applied migration only
+// warns (silently when only comments/formatting changed), as in Postgres.
+func (c *ClickHouse) pending(ctx context.Context, migrations []migratekit.Migration) ([]migratekit.Migration, []coremigrate.TrackedMigration, error) {
 	records, err := c.records(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	bySequence := make(map[int64]migratekit.Migration, len(migrations))
 	for _, m := range migrations {
@@ -443,16 +453,31 @@ func (c *ClickHouse) pending(ctx context.Context, migrations []migratekit.Migrat
 		bySequence[sequence] = m
 	}
 	applied := make(map[int64]bool, len(records))
+	var stamps []coremigrate.TrackedMigration
 	for _, r := range records {
 		m, ok := bySequence[r.Sequence]
 		if !ok {
-			return nil, fmt.Errorf("clickhouse database %q: recorded migration %d (%s) missing from source", c.db, r.Sequence, r.Filename)
+			return nil, nil, fmt.Errorf("clickhouse database %q: recorded migration %d (%s) missing from source", c.db, r.Sequence, r.Filename)
 		}
-		if r.Filename != m.Name || r.Digest != contentDigest(m.Content) {
-			return nil, fmt.Errorf("clickhouse database %q: migration %d identity mismatch (filename or content digest)", c.db, r.Sequence)
+		if r.Filename != m.Name {
+			return nil, nil, fmt.Errorf("clickhouse database %q: migration %d identity mismatch (recorded %s, source %s)", c.db, r.Sequence, r.Filename, m.Name)
 		}
 		if r.Status != "applied" && r.Status != "running" {
-			return nil, fmt.Errorf("clickhouse migration %s has unsupported status %q", m.Name, r.Status)
+			return nil, nil, fmt.Errorf("clickhouse migration %s has unsupported status %q", m.Name, r.Status)
+		}
+		digest, semantic := contentDigest(m.Content), migratekit.SemanticContentDigest(m.Content)
+		switch {
+		case r.Digest == digest:
+			if r.SemanticDigest == "" {
+				r.SemanticDigest = semantic
+				stamps = append(stamps, r)
+			}
+		case r.Status != "applied":
+			// Retrying an incomplete migration with different SQL is unsafe.
+			return nil, nil, fmt.Errorf("clickhouse database %q: incomplete migration %s changed since it started", c.db, m.Name)
+		case r.SemanticDigest != semantic:
+			slog.Default().Warn("migratekit: clickhouse migration changed since it was applied",
+				"database", c.db, "migration", m.Name)
 		}
 		applied[r.Sequence] = r.Status == "applied"
 	}
@@ -463,7 +488,7 @@ func (c *ClickHouse) pending(ctx context.Context, migrations []migratekit.Migrat
 			pending = append(pending, m)
 		}
 	}
-	return pending, nil
+	return pending, stamps, nil
 }
 
 func pendingNames(migrations []migratekit.Migration) []string {

@@ -162,3 +162,40 @@ func TestStrict_LegacyRowsAreNotMismatches(t *testing.T) {
 		t.Fatalf("legacy ledger row must not be treated as a mismatch: %v", err)
 	}
 }
+
+// An old ledger row without a semantic digest is stamped on the next apply, so
+// a later comment-only edit is recognized without a strict-integrity rebuild.
+func TestStrict_BackStampsMissingSemanticDigest(t *testing.T) {
+	const app = "mk_strict_stamp"
+	db, ctx := strictTestDB(t, app)
+	migs := []Migration{{Name: "0001_a.up.sql", Content: "-- note\nCREATE TABLE mk_strict_stamp_a (id int)"}}
+	if err := NewPostgres(db, app).ApplyMigrations(ctx, migs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE public.migrations SET semantic_sha256 = NULL WHERE app = $1`, app); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewPostgres(db, app).ApplyMigrations(ctx, migs); err != nil {
+		t.Fatal(err)
+	}
+	var semantic sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT semantic_sha256 FROM public.migrations WHERE app = $1`, app).Scan(&semantic); err != nil {
+		t.Fatal(err)
+	}
+	if semantic.String != SemanticContentDigest(migs[0].Content) {
+		t.Fatalf("semantic digest not back-stamped: %q", semantic.String)
+	}
+	edited := []Migration{{Name: migs[0].Name, Content: strings.Replace(migs[0].Content, "-- note\n", "", 1)}}
+	if d := drifted(edited, mustRecords(t, ctx, db, app)); len(d) != 0 {
+		t.Fatalf("comment-only edit still counts as drift: %v", d)
+	}
+}
+
+func mustRecords(t *testing.T, ctx context.Context, db *sql.DB, app string) map[string]AppliedRecord {
+	t.Helper()
+	records, err := NewPostgres(db, app).AppliedRecords(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return records
+}

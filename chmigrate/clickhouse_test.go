@@ -28,7 +28,7 @@ func TestClickHouse_AppliedInitializesPostgresTracker(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectQuery("SELECT sequence, .*FROM public\\.migrations").
 		WithArgs("doujins", "clickhouse", "analytics").
-		WillReturnRows(sqlmock.NewRows([]string{"sequence", "filename", "content_sha256", "status", "schema"}).AddRow(int64(1), "1_a.sql", "digest", "applied", "analytics").AddRow(int64(10), "10_b.sql", "digest", "applied", "analytics"))
+		WillReturnRows(sqlmock.NewRows([]string{"sequence", "filename", "content_sha256", "semantic_sha256", "status", "schema"}).AddRow(int64(1), "1_a.sql", "digest", "", "applied", "analytics").AddRow(int64(10), "10_b.sql", "digest", "", "applied", "analytics"))
 
 	ch := New(&Config{
 		ClientAddr: "invalid:0",

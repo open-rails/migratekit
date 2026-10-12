@@ -396,6 +396,13 @@ func (p *Postgres) currentRender(want []Migration) Render {
 // scratchFingerprint builds a chain in a throwaway schema inside tx, reads its
 // fingerprint and rolls the build back, leaving tx as it was.
 func (p *Postgres) scratchFingerprint(ctx context.Context, tx *sql.Tx, render Render) (fp fingerprint, err error) {
+	built := 0
+	defer func() {
+		// One transaction holds a lock per rebuilt object; say so instead of a raw 53200.
+		if err != nil && (strings.Contains(err.Error(), "SQLSTATE 53200") || strings.Contains(err.Error(), "out of shared memory")) {
+			err = fmt.Errorf("migratekit: rebuilding %d migrations in a scratch schema exhausted max_locks_per_transaction; raise it, or accept verified edits with `migratekit repair accept-content`: %w", built, err)
+		}
+	}()
 	var raw [6]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return nil, err
@@ -420,6 +427,7 @@ func (p *Postgres) scratchFingerprint(ctx context.Context, tx *sql.Tx, render Re
 	if err != nil {
 		return nil, err
 	}
+	built = len(chain)
 	for _, m := range chain {
 		if hasNoTransactionDirective(m.Content) {
 			return nil, fmt.Errorf("%s is a no-transaction migration and cannot be rebuilt inside a transaction", m.Name)

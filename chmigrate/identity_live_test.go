@@ -100,13 +100,11 @@ func TestLiveTargetIdentity(t *testing.T) {
 		t.Fatalf("concurrent count=%d err=%v", n, err)
 	}
 	// Identity mismatches anywhere in the batch refuse both validation and all pending DDL.
-	for _, variant := range []string{"filename", "content", "missing"} {
+	for _, variant := range []string{"filename", "missing"} {
 		bad := append([]migratekit.Migration{}, concurrent...)
 		switch variant {
 		case "filename":
 			bad[1].Name = "1_replaced.up.sql"
-		case "content":
-			bad[1].Content += "; SELECT 2"
 		case "missing":
 			bad = bad[:1]
 		}
@@ -122,6 +120,40 @@ func TestLiveTargetIdentity(t *testing.T) {
 	if err := ch.QueryRow(ctx, "EXISTS TABLE "+targets[0]+".must_not_run").Scan(&exists); err != nil || exists != 0 {
 		t.Fatalf("drift wrote DDL: %d %v", exists, err)
 	}
+	// Applied rows carry a semantic digest; an old row without one is back-stamped on apply.
+	semantic := func(seq int) string {
+		var d sql.NullString
+		if err := pg.QueryRowContext(ctx, `SELECT semantic_sha256 FROM public.migrations WHERE app = $1 AND schema = $2 AND sequence = $3`, app, targets[0], seq).Scan(&d); err != nil {
+			t.Fatal(err)
+		}
+		return d.String
+	}
+	if semantic(1) != migratekit.SemanticContentDigest(concurrent[1].Content) {
+		t.Fatal("apply did not record the semantic digest")
+	}
+	if _, err := pg.ExecContext(ctx, `UPDATE public.migrations SET semantic_sha256 = NULL WHERE app = $1 AND schema = $2`, app, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ValidateAllApplied(ctx, concurrent); err != nil || semantic(1) != "" {
+		t.Fatalf("validation must stay read-only: err=%v stamped=%q", err, semantic(1))
+	}
+	if err := a.ApplyMigrations(ctx, concurrent); err != nil || semantic(1) == "" {
+		t.Fatalf("apply did not back-stamp: err=%v", err)
+	}
+	// Content drift on an applied migration only warns: comment-only edits and real edits alike.
+	for _, edit := range []string{"-- a comment\n", "SELECT 3;\n"} {
+		drifted := append([]migratekit.Migration{}, concurrent...)
+		drifted[1].Content = edit + drifted[1].Content
+		if err := a.ValidateAllApplied(ctx, drifted); err != nil {
+			t.Fatalf("validate refused applied drift %q: %v", edit, err)
+		}
+		if err := a.ApplyMigrations(ctx, drifted); err != nil {
+			t.Fatalf("apply refused applied drift %q: %v", edit, err)
+		}
+	}
+	if err := ch.QueryRow(ctx, "SELECT count() FROM "+targets[0]+".proof").Scan(&n); err != nil || n != 2 {
+		t.Fatalf("drift re-ran an applied migration: count=%d err=%v", n, err)
+	}
 	// A partial idempotent migration keeps identity; an explicit retry after fixing its external prerequisite succeeds.
 	partial := append(append([]migratekit.Migration{}, concurrent...), migratekit.Migration{Name: "2_partial.up.sql", Content: "CREATE TABLE IF NOT EXISTS partial (id UInt64) ENGINE=Memory; SELECT throwIf((SELECT count() FROM proof) != 3)"})
 	if err := a.ApplyMigrations(ctx, partial); err == nil {
@@ -132,8 +164,8 @@ func TestLiveTargetIdentity(t *testing.T) {
 	}
 	changed := append([]migratekit.Migration{}, partial...)
 	changed[2].Content += "; SELECT 1"
-	if err := a.ApplyMigrations(ctx, changed); err == nil {
-		t.Fatal("partial identity drift accepted")
+	if err := a.ApplyMigrations(ctx, changed); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("partial identity drift accepted: %v", err)
 	}
 	if err := ch.Exec(ctx, "INSERT INTO "+targets[0]+".proof VALUES (3)"); err != nil {
 		t.Fatal(err)

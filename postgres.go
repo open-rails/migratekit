@@ -323,6 +323,9 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	if err := p.ensureSetup(ctx); err != nil {
 		return err
 	}
+	if err := p.stampSemanticDigests(ctx, migrations); err != nil {
+		return err
+	}
 	if err := p.reconcile(ctx, migrations); err != nil {
 		return err
 	}
@@ -444,5 +447,31 @@ func (p *Postgres) ValidateAllApplied(ctx context.Context, migrations []Migratio
 		return fmt.Errorf("%d pending migrations must be applied: %v", len(pending), pending)
 	}
 
+	return nil
+}
+
+// stampSemanticDigests records the semantic digest on applied rows that lack
+// one while their bytes still match, so a later comment-only edit is
+// recognized without a strict-integrity scratch rebuild. Idempotent; no lock.
+func (p *Postgres) stampSemanticDigests(ctx context.Context, migrations []Migration) error {
+	records, err := p.AppliedRecords(ctx)
+	if err != nil {
+		return err
+	}
+	for _, m := range migrations {
+		rec, ok := records[Prefix(m.Name)]
+		if !ok || rec.isDirty() || rec.SemanticDigest != "" || rec.Digest == "" || rec.Digest != ContentDigest(m.Content) {
+			continue
+		}
+		seq, err := Sequence(m.Name)
+		if err != nil {
+			return err
+		}
+		if _, err := p.db.ExecContext(ctx, `UPDATE public.migrations SET semantic_sha256 = $1
+ WHERE app = $2 AND database = $3 AND schema = $4 AND sequence = $5 AND content_sha256 = $6 AND COALESCE(semantic_sha256, '') = ''`,
+			SemanticContentDigest(m.Content), p.app, postgresDriver, p.schema, seq, rec.Digest); err != nil {
+			return fmt.Errorf("stamp semantic digest for %s: %w", m.Name, err)
+		}
+	}
 	return nil
 }
