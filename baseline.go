@@ -156,17 +156,19 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 	// A preview reads without the lock: it is advisory, and a global migration
 	// lock is too heavy a price for a question. The write takes the lock BEFORE
 	// it reads, so the plan it acts on is the plan it wrote.
+	var db migrationDB = p.db
 	if !req.DryRun {
 		if err := p.lock(ctx); err != nil {
 			return nil, err
 		}
+		db = p.lockConn
 		defer func() {
 			if unlockErr := p.unlock(ctx); unlockErr != nil {
 				err = errors.Join(err, unlockErr)
 			}
 		}()
 	}
-	applied, err := p.AppliedRecords(ctx)
+	applied, err := p.appliedRecords(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +198,7 @@ func (p *Postgres) Baseline(ctx context.Context, migrations []Migration, req Bas
 		return results, nil
 	}
 
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}

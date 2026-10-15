@@ -84,7 +84,7 @@ func (r AppliedRecord) isDirty() bool {
 // advisory lock. The statements are executed individually: a single Exec of a
 // multi-statement string is wrapped in an implicit transaction by Postgres,
 // which is exactly what the directive exists to avoid.
-func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairRequest) error {
+func (p *Postgres) applyOneNoTx(ctx context.Context, conn *sql.Conn, m Migration, audit *RepairRequest) error {
 	key := Prefix(m.Name)
 	sequence, err := Sequence(m.Name)
 	if err != nil {
@@ -111,7 +111,7 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 
 	// Claim the row BEFORE executing. A process killed mid-run must leave
 	// evidence; an absent row would look like a migration that never started.
-	if _, err := p.db.ExecContext(ctx,
+	if _, err := conn.ExecContext(ctx,
 		`INSERT INTO public.migrations (app, database, schema, sequence, filename, content_sha256, semantic_sha256, status)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (app, database, schema, sequence)
@@ -120,19 +120,19 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 		return fmt.Errorf("claim %s: %w", m.Name, err)
 	}
 
-	execErr := p.execOutsideTransaction(ctx, sqlText)
+	execErr := p.execOutsideTransaction(ctx, conn, sqlText)
 	if execErr != nil {
-		_, updErr := p.db.ExecContext(ctx,
+		_, updErr := conn.ExecContext(ctx,
 			`UPDATE public.migrations SET status = $5, "error" = $6
 			  WHERE app = $1 AND database = $2 AND schema = $3 AND sequence = $4`,
 			p.app, postgresDriver, p.schema, sequence, StatusFailed, execErr.Error())
 		return errors.Join(fmt.Errorf(
 			"migration %s failed OUTSIDE a transaction and may be PARTIALLY applied: %w\n"+
-				"  It is recorded %s in the ledger and boot will refuse until an operator resolves it. %s",
-			m.Name, execErr, StatusFailed, statusHint), updErr)
+				"  It remains unfinished in the ledger and boot will refuse until an operator resolves it. %s",
+			m.Name, execErr, statusHint), updErr)
 	}
 
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -151,22 +151,25 @@ func (p *Postgres) applyOneNoTx(ctx context.Context, m Migration, audit *RepairR
 	return tx.Commit()
 }
 
-// execOutsideTransaction runs each statement on one pinned connection with no
-// BeginTx. The connection is discarded afterwards, so a session-level
-// search_path cannot leak back into the pool.
-func (p *Postgres) execOutsideTransaction(ctx context.Context, sqlText string) error {
-	conn, err := p.db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
+// execOutsideTransaction runs each statement on the advisory-lock connection
+// without BeginTx. Restore its previous search_path before returning it to the
+// pool, including when statement execution is cancelled or fails.
+func (p *Postgres) execOutsideTransaction(ctx context.Context, conn *sql.Conn, sqlText string) (err error) {
 	if strings.TrimSpace(p.schema) != "" {
 		quoted, err := quoteIdent(p.schema)
 		if err != nil {
 			return fmt.Errorf("invalid schema %q: %w", p.schema, err)
 		}
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET search_path = %s, public", quoted)); err != nil {
+		var previous string
+		if err := conn.QueryRowContext(ctx, "SHOW search_path").Scan(&previous); err != nil {
+			return fmt.Errorf("read search_path: %w", err)
+		}
+		defer func() {
+			if _, resetErr := conn.ExecContext(context.WithoutCancel(ctx), "SELECT set_config('search_path', $1, false)", previous); resetErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore search_path: %w", resetErr), discardMigrationConn(conn))
+			}
+		}()
+		if _, err := conn.ExecContext(ctx, "SELECT set_config('search_path', $1, false)", quoted+", public"); err != nil {
 			return fmt.Errorf("set search_path: %w", err)
 		}
 	}

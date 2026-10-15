@@ -4,9 +4,14 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.11.1 is the recommended v1 release.** It makes ClickHouse content drift a
-warning (filename stays identity), records and back-stamps semantic digests on
-both ledgers, and explains lock-table exhaustion during strict-integrity
+**v1.11.2 is the recommended v1 release.** PostgreSQL migration work and its
+under-lock ledger checks now share the advisory-lock connection, including
+baselines, conversions and strict integrity. A one-connection pool can migrate
+and replay without deadlocking. Failed lock release or session restoration
+discards the physical connection, preserving the original SQL error and any
+unfinished migration ledger record. v1.11.1 made ClickHouse content drift a
+warning (filename stays identity), recorded and back-stamped semantic digests on
+both ledgers, and explained lock-table exhaustion during strict-integrity
 rebuilds. v1.11.0 removed `-- parent:` header
 links (`Load` options, `VerifyChain`, `CheckChainFS`, `Relink`, `migratekit
 relink`); existing header lines are ordinary comments. v1.10.0 added verified
@@ -28,7 +33,7 @@ excludes the retired versions from normal version queries; see
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit@v1.10.0
+go get github.com/open-rails/migratekit@v1.11.2
 ```
 
 ## Usage
@@ -217,7 +222,7 @@ Unexported helpers and exact error-message wording are implementation details.
 | Symbol | Contract |
 |---|---|
 | `NewPostgres(db *sql.DB, app string) *Postgres` | Migrator for one app's migrations. Never closes `db`. |
-| `NewPostgresFromPGXPool(pool *pgxpool.Pool, app string) (*Postgres, error)` | Creates an isolated, two-connection migration handle from a host pgx pool. The returned migrator owns that handle; call `Close` when done. The host pool is never used or mutated. |
+| `NewPostgresFromPGXPool(pool *pgxpool.Pool, app string) (*Postgres, error)` | Creates an isolated, one-connection migration handle from a host pgx pool. The returned migrator owns that handle; call `Close` when done. The host pool is never used or mutated. |
 | `(*Postgres) Close() error` | Closes the isolated database handle created by `NewPostgresFromPGXPool`; no-op for `NewPostgres` values. |
 | `(*Postgres) WithSchema(schema string, rewriteFrom ...string) *Postgres` | Migrations run under `SET LOCAL search_path = "<schema>", public`. Optional `rewriteFrom` canonical schema names are rewritten to `schema` in migration SQL before execution, for portable hard-qualified app DDL such as `openrails.foo`. Tracking stays in `public.migrations`. |
 | `(*Postgres) ApplyMigrations(ctx, []Migration) error` | The one-call path: atomically initializes the tracking tables under the global bootstrap lock, then applies every unapplied migration in order under the migration advisory lock (lock taken only when there is work), records each by `Prefix`. Each migration runs in its own transaction. |
@@ -270,7 +275,7 @@ These behaviors define the current API:
 1. **Tracking table**: `public.migrations (id, app, database, schema, sequence, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, sequence))` with `database` ∈ {`postgres`, `clickhouse`}. `public.migration_repairs` records every repair.
 2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is always an operator warning; comment/format-only edits compare cleanly through `semantic_sha256`.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
-4. **Locking**: appliers are serialized by Postgres advisory locks held on a dedicated pinned connection for the duration of the apply; the lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
+4. **Locking**: appliers are serialized by Postgres advisory locks held on a pinned connection for the duration of the apply. Under-lock ledger checks, DDL and ledger writes use that same connection, so a pool limited to one connection is supported. Nontransactional migrations restore its previous `search_path` before release. The lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
 6. **Postgres atomicity**: one migration = one transaction — the DDL and its ledger row commit together, so a failed migration applies nothing and records nothing. **The one exception is explicit**: a migration whose leading comment block carries `-- migratekit:no-transaction` runs outside a transaction and can fail half-applied; the ledger then records it `failed` (or `running` after a crash) and boot refuses until an operator resolves it.
 7. **Postgres schema targeting**: `WithSchema(schema)` sets a per-migration transaction search path for unqualified SQL. `WithSchema(schema, "canonical")` also rewrites app-owned canonical schema references to `schema` before execution; use this for portable hard-qualified DDL, not for shared schemas like `public`.

@@ -3,6 +3,7 @@ package migratekit
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -113,7 +114,18 @@ func defaultWarn(d Discrepancy) {
 
 // AppliedRecords returns the applied-migrations ledger keyed by ledger key.
 func (p *Postgres) AppliedRecords(ctx context.Context) (map[string]AppliedRecord, error) {
-	rows, err := p.db.QueryContext(ctx,
+	return p.appliedRecords(ctx, p.db)
+}
+
+// migrationDB is implemented by both the pool and its pinned lock connection.
+// Callers pass the lock connection explicitly for work inside an advisory lock.
+type migrationDB interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
+func (p *Postgres) appliedRecords(ctx context.Context, db migrationDB) (map[string]AppliedRecord, error) {
+	rows, err := db.QueryContext(ctx,
 		`SELECT sequence, COALESCE(filename, ''), COALESCE(content_sha256, ''), COALESCE(semantic_sha256, ''),
 		        COALESCE(status, ''), COALESCE("error", '')
 		   FROM public.migrations

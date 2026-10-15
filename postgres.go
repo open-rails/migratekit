@@ -3,12 +3,14 @@ package migratekit
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -66,9 +68,9 @@ func NewPostgres(db *sql.DB, app string) *Postgres {
 
 // NewPostgresFromPGXPool creates a migration handle from a host pgx pool
 // without using or mutating that pool. Migrations use connection-local session
-// state (search_path, lock_timeout, statement_timeout) and pin one connection
-// for the advisory lock while applying on another, so sharing the host pool
-// could leak migration state into ordinary application queries.
+// state (search_path, lock_timeout, statement_timeout), so sharing the host pool
+// could leak migration state into ordinary application queries. The advisory
+// lock, under-lock checks and migration work all use the same connection.
 //
 // The returned Postgres owns a separate *sql.DB. Call Close when the migration
 // or validation operation is complete. The pool's connection configuration is
@@ -91,10 +93,9 @@ func NewPostgresFromPGXPool(pool *pgxpool.Pool, app string) (*Postgres, error) {
 		opts = append(opts, stdlib.OptionAfterConnect(cfg.AfterConnect))
 	}
 	db := stdlib.OpenDB(*cfg.ConnConfig.Copy(), opts...)
-	// migrate() pins one connection for the advisory lock and applies on a
-	// second connection. Keep the owned adapter bounded to that requirement.
-	db.SetMaxOpenConns(2)
-	db.SetMaxIdleConns(2)
+	// The lock and migration work share one session.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	return &Postgres{db: db, app: app, ownedDB: db}, nil
 }
 
@@ -212,8 +213,9 @@ func (p *Postgres) lock(ctx context.Context) error {
 		return fmt.Errorf("acquire connection for migration advisory lock: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, coremigrate.MigrationSetupLockKey); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("acquire global migration advisory lock: %w", err)
+		// The server may have acquired the session lock before the driver
+		// observed cancellation or a transport error. Do not pool that session.
+		return errors.Join(fmt.Errorf("acquire global migration advisory lock: %w", err), discardMigrationConn(conn))
 	}
 	p.lockConn = conn
 	return nil
@@ -221,8 +223,8 @@ func (p *Postgres) lock(ctx context.Context) error {
 
 // unlock releases the global advisory lock and the pinned connection. It
 // runs with a non-cancellable context so a cancelled migration still
-// releases the lock; closing the pinned connection is the safety net that
-// releases the session lock even if pg_advisory_unlock itself fails.
+// releases the lock. If release cannot be confirmed, discard the physical
+// session: sql.Conn.Close alone would return it to the pool with its lock.
 func (p *Postgres) unlock(ctx context.Context) error {
 	p.lockMu.Lock()
 	defer p.lockMu.Unlock()
@@ -234,16 +236,35 @@ func (p *Postgres) unlock(ctx context.Context) error {
 	var unlocked bool
 	err := p.lockConn.QueryRowContext(ctx,
 		`SELECT pg_advisory_unlock($1)`, coremigrate.MigrationSetupLockKey).Scan(&unlocked)
-	closeErr := p.lockConn.Close() // releases the session lock even on unlock failure
+	conn := p.lockConn
 	p.lockConn = nil
 
 	if err != nil {
-		return errors.Join(fmt.Errorf("release global migration advisory lock: %w", err), closeErr)
+		return errors.Join(fmt.Errorf("release global migration advisory lock: %w", err), discardMigrationConn(conn))
 	}
 	if !unlocked {
-		return errors.Join(fmt.Errorf("advisory lock was not held"), closeErr)
+		return errors.Join(fmt.Errorf("advisory lock was not held"), discardMigrationConn(conn))
 	}
-	return closeErr
+	return conn.Close()
+}
+
+// Returning ErrBadConn through Raw discards the database/sql driver session.
+// A pgxpool adapter's driver Close only releases its inner pooled connection,
+// so close that physical connection first rather than pool an uncertain lock.
+func discardMigrationConn(conn *sql.Conn) error {
+	var closeErr error
+	err := conn.Raw(func(raw any) error {
+		if pgxConn, ok := raw.(*stdlib.Conn); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			closeErr = pgxConn.Conn().Close(ctx)
+		}
+		return driver.ErrBadConn
+	})
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) {
+		return closeErr // Raw discarded it, or the driver already closed it.
+	}
+	return errors.Join(err, closeErr)
 }
 
 // applyOne applies a single migration without checking the applied set or
@@ -251,15 +272,15 @@ func (p *Postgres) unlock(ctx context.Context) error {
 // migrations first (see ApplyMigrations). A non-nil audit records an
 // ordering-exception audit row in the same transaction as the DDL, so the
 // deviation and the schema change are one atomic fact.
-func (p *Postgres) applyOne(ctx context.Context, m Migration, audit *RepairRequest) error {
+func (p *Postgres) applyOne(ctx context.Context, conn *sql.Conn, m Migration, audit *RepairRequest) error {
 	sequence, err := Sequence(m.Name)
 	if err != nil {
 		return err
 	}
 	if hasNoTransactionDirective(m.Content) {
-		return p.applyOneNoTx(ctx, m, audit)
+		return p.applyOneNoTx(ctx, conn, m, audit)
 	}
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -367,8 +388,10 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 		}
 	}()
 
-	// Double-check under lock in case another process applied some since our first read
-	records, err = p.AppliedRecords(ctx)
+	// Double-check and apply on the lock session: a one-connection pool cannot
+	// lend another connection while the advisory lock is pinned. Rechecking
+	// here still catches claims made by a competing migrator after our first read.
+	records, err = p.appliedRecords(ctx, p.lockConn)
 	if err != nil {
 		return err
 	}
@@ -391,7 +414,7 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 		if err != nil {
 			return fmt.Errorf("invalid schema %q: %w", p.schema, err)
 		}
-		if _, err := p.db.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
+		if _, err := p.lockConn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
 			return fmt.Errorf("ensure schema %s: %w", p.schema, err)
 		}
 	}
@@ -401,7 +424,7 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 		if audit != nil && allowBelow[Prefix(mig.Name)] {
 			rowAudit = audit
 		}
-		if err := p.applyOne(ctx, mig, rowAudit); err != nil {
+		if err := p.applyOne(ctx, p.lockConn, mig, rowAudit); err != nil {
 			return err
 		}
 	}

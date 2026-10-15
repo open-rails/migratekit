@@ -110,7 +110,7 @@ func (p *Postgres) reconcile(ctx context.Context, migrations []Migration) (err e
 			err = errors.Join(err, unlockErr)
 		}
 	}()
-	if records, err = p.AppliedRecords(ctx); err != nil {
+	if records, err = p.appliedRecords(ctx, p.lockConn); err != nil {
 		return err
 	}
 	for _, c := range p.conversions {
@@ -119,12 +119,12 @@ func (p *Postgres) reconcile(ctx context.Context, migrations []Migration) (err e
 			return fmt.Errorf("migratekit: render retired chain %s: %w", c.Name, err)
 		}
 		if ledgerRecords(records, retired) {
-			return p.convert(ctx, c, migrations, records, false)
+			return p.convert(ctx, p.lockConn, c, migrations, records, false)
 		}
 	}
 	if len(records) == 0 && len(p.conversions) > 0 {
 		for _, c := range p.conversions {
-			err := p.convert(ctx, c, migrations, records, true)
+			err := p.convert(ctx, p.lockConn, c, migrations, records, true)
 			if errors.Is(err, errShapeDiffers) {
 				continue
 			}
@@ -133,7 +133,7 @@ func (p *Postgres) reconcile(ctx context.Context, migrations []Migration) (err e
 		return nil
 	}
 	if p.strictIntegrity {
-		return p.settleDrift(ctx, migrations, records)
+		return p.settleDrift(ctx, p.lockConn, migrations, records)
 	}
 	return nil
 }
@@ -182,7 +182,7 @@ func ledgerRecords(records map[string]AppliedRecord, retired []Migration) bool {
 
 var errShapeDiffers = errors.New("schema shape differs from the retired chain")
 
-func (p *Postgres) convert(ctx context.Context, c Conversion, migrations []Migration, records map[string]AppliedRecord, ledgerless bool) error {
+func (p *Postgres) convert(ctx context.Context, conn *sql.Conn, c Conversion, migrations []Migration, records map[string]AppliedRecord, ledgerless bool) error {
 	if c.Replaces < 1 || c.Replaces > len(migrations) {
 		return fmt.Errorf("migratekit: conversion %s replaces %d migrations, but the tree carries %d", c.Name, c.Replaces, len(migrations))
 	}
@@ -192,7 +192,7 @@ func (p *Postgres) convert(ctx context.Context, c Conversion, migrations []Migra
 		fallback = " Alternatively run " + c.Fallback + "."
 	}
 
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -284,7 +284,7 @@ func (p *Postgres) convert(ctx context.Context, c Conversion, migrations []Migra
 // settleDrift decides content drift on the schema, not the bytes: if the live
 // schema equals a fresh build of the applied migrations, the edit changed
 // nothing a database does and the digests are re-stamped on the record.
-func (p *Postgres) settleDrift(ctx context.Context, migrations []Migration, records map[string]AppliedRecord) error {
+func (p *Postgres) settleDrift(ctx context.Context, conn *sql.Conn, migrations []Migration, records map[string]AppliedRecord) error {
 	edited := drifted(migrations, records)
 	if len(edited) == 0 {
 		return nil
@@ -309,7 +309,7 @@ func (p *Postgres) settleDrift(ctx context.Context, migrations []Migration, reco
 		}
 	}
 
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

@@ -2,8 +2,15 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.11.1: v1.11.0 with ClickHouse content drift as a
-warning and semantic-digest back-stamping. v1.11.0 is v1.10.0 without
+The recommended release is v1.11.2: PostgreSQL migrations, baselines,
+conversions and strict-integrity checks run on the advisory-lock session rather
+than acquiring another connection. One-connection pools are supported; replay,
+concurrent identity and ordering checks, transaction rollback, cancellation
+cleanup and nontransactional search-path restoration are covered by live tests.
+Unconfirmed lock release or failed session restoration physically discards the
+connection, including when database/sql wraps a pgx pool.
+v1.11.1 added ClickHouse content drift as a warning and semantic-digest
+back-stamping. v1.11.0 is v1.10.0 without
 `-- parent:` header links.
 v1.10.0 is v1.0.5 plus application-declared conversions from retired chains and
 opt-in strict integrity. v1.1.x through

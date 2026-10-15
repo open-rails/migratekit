@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    name: PostgreSQL migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_USER: migratekit
+          POSTGRES_PASSWORD: migratekit
+          POSTGRES_DB: migratekit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U migratekit -d migratekit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MIGRATEKIT_TEST_DATABASE_URL: postgres://migratekit:migratekit@localhost:5432/migratekit?sslmode=disable
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet and build all packages
+        run: |
+          go vet ./...
+          go build ./...
+      - name: Test PostgreSQL and core migrations with the race detector
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=5m -json . ./internal/... | tee "$RUNNER_TEMP/migratekit-postgres.jsonl"
+      - name: Require live single-connection regression coverage
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          events = [json.loads(line) for line in Path(
+              os.environ["RUNNER_TEMP"], "migratekit-postgres.jsonl"
+          ).read_text().splitlines()]
+          required = {
+              "TestPostgresSingleConnectionFreshReplay",
+              "TestPostgresSingleConnectionDedicatedAdapter",
+              "TestPostgresSingleConnectionCompetingMigrators",
+              "TestPostgresSingleConnectionCancellation",
+              "TestPostgresSingleConnectionNoTransactionFailure",
+              "TestPostgresSingleConnectionLedgerOperations",
+          }
+          passed = {event.get("Test") for event in events if event["Action"] == "pass"}
+          skipped = [event for event in events if event["Action"] == "skip"]
+          missing = sorted(required - passed)
+          if missing or skipped:
+              raise SystemExit(f"Missing required tests: {missing}; skipped tests: {skipped}")
+          print(f"All {len(required)} required live regressions passed; no tests skipped.")
+          PY
