@@ -113,6 +113,7 @@ func TestNoTransaction_LiveFailureIsDirtyAndBlocksBoot(t *testing.T) {
 }
 
 func TestNoTransaction_LiveRepairResolve(t *testing.T) {
+	clearCI(t)
 	db, app := liveDB(t, "migratekit-notx-resolve")
 	ctx := context.Background()
 
