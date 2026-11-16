@@ -2,8 +2,11 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.11.2: PostgreSQL migrations, baselines,
-conversions and strict-integrity checks run on the advisory-lock session rather
+The recommended release is v1.11.3: schema fingerprints ignore partition
+children, so conversions and strict integrity accept a database whose
+partitions differ from a fresh build's; the partitioned parent is still
+compared. v1.11.2 runs PostgreSQL migrations, baselines,
+conversions and strict-integrity checks on the advisory-lock session rather
 than acquiring another connection. One-connection pools are supported; replay,
 concurrent identity and ordering checks, transaction rollback, cancellation
 cleanup and nontransactional search-path restoration are covered by live tests.

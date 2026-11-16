@@ -45,7 +45,7 @@ jobs:
         run: |
           set -o pipefail
           go test -race -count=1 -timeout=5m -json . ./internal/... | tee "$RUNNER_TEMP/migratekit-postgres.jsonl"
-      - name: Require live single-connection regression coverage
+      - name: Require live regression coverage
         run: |
           python3 - <<'PY'
           import json
@@ -62,6 +62,8 @@ jobs:
               "TestPostgresSingleConnectionCancellation",
               "TestPostgresSingleConnectionNoTransactionFailure",
               "TestPostgresSingleConnectionLedgerOperations",
+              "TestFingerprintIgnoresPartitionChildren",
+              "TestStrictIntegrityIgnoresPartitionChildren",
           }
           passed = {event.get("Test") for event in events if event["Action"] == "pass"}
           skipped = [event for event in events if event["Action"] == "skip"]
