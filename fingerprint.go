@@ -20,7 +20,12 @@ import (
 // comments, ownership and grants, the names of plain indexes, and the values
 // of sequences. Constraint and trigger names are kept: application code
 // matches on constraint names, and trigger names decide firing order.
-// Objects that belong to an extension are skipped.
+// Objects that belong to an extension are skipped. So are partitions, default
+// and sub-partitioned ones included, with everything attached to them: which
+// partitions exist is where an application has put its rows (it makes and
+// drops them by date at run time), not something a migration's text decides,
+// and the partitioned parent carries the key, columns, constraints, indexes
+// and triggers they inherit.
 //
 // Expressions (CHECK constraints, defaults, index definitions, policies,
 // views) are compared in canonical form: printed, parsed back into a scratch
@@ -180,6 +185,12 @@ const notExtensionMember = `NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid 
 
 func extFilter(expr string) string { return fmt.Sprintf(notExtensionMember, expr) }
 
+// ownedByPartition matches a sequence (c) owned by a partition's column.
+const ownedByPartition = `EXISTS (
+		SELECT 1 FROM pg_depend d JOIN pg_class o ON o.oid = d.refobjid
+		 WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+		   AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a','i') AND o.relispartition)`
+
 // indexHead is "CREATE [UNIQUE] INDEX <name> ON [ONLY] <table> ": the name is
 // cosmetic and the table is already a field of the line.
 var indexHead = regexp.MustCompile(`^CREATE (UNIQUE )?INDEX \S+ ON (?:ONLY )?\S+ `)
@@ -188,10 +199,10 @@ var fingerprintQueries = []fingerprintQuery{
 	{kind: "relation", sql: `
 		SELECT c.relname, c.relkind::text, c.relpersistence::text,
 		       c.relrowsecurity::text, c.relforcerowsecurity::text,
-		       CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END,
-		       pg_get_expr(c.relpartbound, c.oid)
+		       CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END
 		  FROM pg_class c
 		 WHERE c.relnamespace = $1 AND c.relkind IN ('r','p','v','m','f','c','S')
+		   AND NOT c.relispartition AND NOT (c.relkind = 'S' AND ` + ownedByPartition + `)
 		   AND ` + extFilter("c.oid")},
 	{kind: "column", sql: `
 		SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
@@ -207,8 +218,10 @@ var fingerprintQueries = []fingerprintQuery{
 		  LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
 		  LEFT JOIN pg_collation co ON co.oid = a.attcollation
 		 WHERE c.relnamespace = $1 AND c.relkind IN ('r','p','v','m','f','c')
-		   AND a.attnum > 0 AND NOT a.attisdropped
+		   AND a.attnum > 0 AND NOT a.attisdropped AND NOT c.relispartition
 		   AND ` + extFilter("c.oid")},
+	// conparentid: a foreign key to a partitioned table keeps one clone per
+	// referenced partition, and those sit on the referencing table.
 	{kind: "constraint", sql: `
 		SELECT COALESCE(cl.relname, ty.typname), con.conname, con.contype::text,
 		       CASE WHEN con.contype = 'c' AND con.conrelid <> 0
@@ -217,13 +230,15 @@ var fingerprintQueries = []fingerprintQuery{
 		  FROM pg_constraint con
 		  LEFT JOIN pg_class cl ON cl.oid = con.conrelid
 		  LEFT JOIN pg_type ty ON ty.oid = con.contypid
-		 WHERE con.connamespace = $1 AND ` + extFilter("con.oid")},
+		 WHERE con.connamespace = $1 AND NOT COALESCE(cl.relispartition, false)
+		   AND con.conparentid = 0
+		   AND ` + extFilter("con.oid")},
 	{kind: "index", sql: `
 		SELECT tc.relname, COALESCE(pg_temp.mk_canon_index(i.indrelid, pg_get_indexdef(i.indexrelid)), pg_get_indexdef(i.indexrelid))
 		  FROM pg_index i
 		  JOIN pg_class ic ON ic.oid = i.indexrelid
 		  JOIN pg_class tc ON tc.oid = i.indrelid
-		 WHERE ic.relnamespace = $1
+		 WHERE ic.relnamespace = $1 AND NOT tc.relispartition
 		   AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid AND k.contype IN ('p','u','x'))
 		   AND ` + extFilter("i.indexrelid"),
 		post: func(f []string) []string {
@@ -233,7 +248,7 @@ var fingerprintQueries = []fingerprintQuery{
 	{kind: "trigger", sql: `
 		SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid, true), t.tgenabled::text
 		  FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-		 WHERE c.relnamespace = $1 AND NOT t.tgisinternal`},
+		 WHERE c.relnamespace = $1 AND NOT t.tgisinternal AND NOT c.relispartition`},
 	{kind: "function", sql: `
 		SELECT p.proname, pg_get_function_identity_arguments(p.oid),
 		       CASE WHEN p.prokind IN ('f','p') THEN pg_get_functiondef(p.oid) ELSE p.prokind::text END
@@ -255,7 +270,8 @@ var fingerprintQueries = []fingerprintQuery{
 		         WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
 		           AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a','i'))
 		  FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid
-		 WHERE c.relnamespace = $1 AND ` + extFilter("c.oid")},
+		 WHERE c.relnamespace = $1 AND NOT ` + ownedByPartition + `
+		   AND ` + extFilter("c.oid")},
 	{kind: "type", sql: `
 		SELECT t.typname, t.typtype::text,
 		       CASE t.typtype
@@ -272,11 +288,11 @@ var fingerprintQueries = []fingerprintQuery{
 		       COALESCE(pg_temp.mk_canon_policy(pol.polrelid, pg_get_expr(pol.polqual, pol.polrelid), 'using'), pg_get_expr(pol.polqual, pol.polrelid)),
 		       COALESCE(pg_temp.mk_canon_policy(pol.polrelid, pg_get_expr(pol.polwithcheck, pol.polrelid), 'check'), pg_get_expr(pol.polwithcheck, pol.polrelid))
 		  FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid
-		 WHERE c.relnamespace = $1`},
+		 WHERE c.relnamespace = $1 AND NOT c.relispartition`},
 	{kind: "rule", sql: `
 		SELECT c.relname, r.rulename, pg_get_ruledef(r.oid, true)
 		  FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class
-		 WHERE c.relnamespace = $1 AND r.rulename <> '_RETURN'`},
+		 WHERE c.relnamespace = $1 AND r.rulename <> '_RETURN' AND NOT c.relispartition`},
 }
 
 // schemaNormalizer replaces a schema's own name wherever the catalog prints

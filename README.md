@@ -4,8 +4,11 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.11.2 is the recommended v1 release.** PostgreSQL migration work and its
-under-lock ledger checks now share the advisory-lock connection, including
+**v1.11.3 is the recommended v1 release.** Schema comparison (conversions,
+strict integrity and `SchemaDiff`) no longer counts partition children, so a
+database whose application makes and drops partitions at run time equals a
+fresh build of its chain. v1.11.2 moved PostgreSQL migration work and its
+under-lock ledger checks onto the advisory-lock connection, including
 baselines, conversions and strict integrity. A one-connection pool can migrate
 and replay without deadlocking. Failed lock release or session restoration
 discards the physical connection, preserving the original SQL error and any
@@ -33,7 +36,7 @@ excludes the retired versions from normal version queries; see
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit@v1.11.2
+go get github.com/open-rails/migratekit@v1.11.3
 ```
 
 ## Usage
@@ -316,7 +319,10 @@ Reference builds run the migrations in a throwaway schema inside the same
 transaction, so nothing is hard-coded and nothing persists. Schemas compare by
 behaviour: tables, columns, types, constraints (with names), indexes (not their
 names), triggers, functions, views, sequences and policies; not column order,
-comments, ownership or grants.
+comments, ownership or grants. Partitions are not compared, nor anything
+attached to one: which partitions exist is where the application has put its
+rows, and the partitioned parent carries what they inherit. A detached
+partition is an ordinary table and is compared.
 
 ### Authoring checks
 
