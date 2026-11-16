@@ -2,7 +2,12 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.11.3: schema fingerprints ignore partition
+The recommended release is v1.11.4: reading a schema fingerprint releases
+the locks of each canonicalization as it goes, so conversions and strict
+integrity run on a default PostgreSQL whatever the size of the schema; the
+reference build still locks every relation it creates, and a full lock table
+is reported with what was being done and `max_locks_per_transaction`.
+v1.11.3 made schema fingerprints ignore partition
 children, so conversions and strict integrity accept a database whose
 partitions differ from a fresh build's; the partitioned parent is still
 compared. v1.11.2 runs PostgreSQL migrations, baselines,

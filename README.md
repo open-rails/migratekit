@@ -4,8 +4,12 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.11.3 is the recommended v1 release.** Schema comparison (conversions,
-strict integrity and `SchemaDiff`) no longer counts partition children, so a
+**v1.11.4 is the recommended v1 release.** Schema comparison (conversions,
+strict integrity and `SchemaDiff`) no longer fills the server's lock table:
+reading a schema holds the same few locks whatever its size, where v1.11.3
+and earlier kept several per CHECK, default, index, policy and view and ran a
+default PostgreSQL out of shared memory on a schema of about a hundred tables.
+v1.11.3 stopped counting partition children, so a
 database whose application makes and drops partitions at run time equals a
 fresh build of its chain. v1.11.2 moved PostgreSQL migration work and its
 under-lock ledger checks onto the advisory-lock connection, including
@@ -36,7 +40,7 @@ excludes the retired versions from normal version queries; see
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit@v1.11.3
+go get github.com/open-rails/migratekit@v1.11.4
 ```
 
 ## Usage
@@ -323,6 +327,16 @@ comments, ownership or grants. Partitions are not compared, nor anything
 attached to one: which partitions exist is where the application has put its
 rows, and the partitioned parent carries what they inherit. A detached
 partition is an ordinary table and is compared.
+
+Reading a schema takes a small, fixed number of locks. The reference build
+takes more: until it is rolled back it holds a lock on every table, TOAST
+table, index, sequence and view the migrations create, and on PostgreSQL 18
+two more per table (about 3200 lock table entries for 400 tables with three
+indexes each). The server's lock table has at least
+`max_locks_per_transaction` × (`max_connections` + `max_prepared_transactions`)
+entries, 6400 by default, shared by every session. When too few are free the
+refusal says what was being done and names the setting, and nothing is
+changed.
 
 ### Authoring checks
 

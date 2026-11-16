@@ -64,6 +64,9 @@ jobs:
               "TestPostgresSingleConnectionLedgerOperations",
               "TestFingerprintIgnoresPartitionChildren",
               "TestStrictIntegrityIgnoresPartitionChildren",
+              "TestCanonicalizersReleaseTheirLocks",
+              "TestFingerprintLocksDoNotGrowWithTheSchema",
+              "TestLockTableExhaustionIsExplained",
           }
           passed = {event.get("Test") for event in events if event["Action"] == "pass"}
           skipped = [event for event in events if event["Action"] == "skip"]

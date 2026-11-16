@@ -41,7 +41,8 @@ type fingerprint []string
 // schema-qualified, then replaces the schema's own name with a placeholder so
 // the same objects in two schemas compare equal.
 func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fp fingerprint, err error) {
-	// The canonicalizers create temp objects; the savepoint takes them away.
+	// The savepoint takes away the canonicalizers, the search_path and every
+	// lock the catalog reads took.
 	if _, err := tx.ExecContext(ctx, "SAVEPOINT migratekit_fingerprint"); err != nil {
 		return nil, err
 	}
@@ -54,6 +55,13 @@ func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fp finge
 			err = errors.Join(err, relErr)
 		}
 	}()
+	fp, err = readFingerprint(ctx, tx, schema)
+	return fp, lockTableError(fmt.Sprintf("reading the fingerprint of schema %q", schema), err)
+}
+
+// readFingerprint is schemaFingerprint without its savepoint: what it changed
+// and locked stays until the caller undoes it.
+func readFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fingerprint, error) {
 	if _, err := tx.ExecContext(ctx, "SET LOCAL search_path = pg_catalog"); err != nil {
 		return nil, fmt.Errorf("fingerprint %s: %w", schema, err)
 	}
@@ -61,7 +69,7 @@ func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fp finge
 		return nil, fmt.Errorf("fingerprint %s: install canonicalizers: %w", schema, err)
 	}
 	var oid uint32
-	err = tx.QueryRowContext(ctx, `SELECT oid FROM pg_namespace WHERE nspname = $1`, schema).Scan(&oid)
+	err := tx.QueryRowContext(ctx, `SELECT oid FROM pg_namespace WHERE nspname = $1`, schema).Scan(&oid)
 	if err == sql.ErrNoRows {
 		return fingerprint{}, nil
 	}
@@ -113,6 +121,13 @@ func schemaFingerprint(ctx context.Context, tx *sql.Tx, schema string) (fp finge
 // canonicalizers print an expression, parse it back against a temp copy of
 // its table, and print it again. They return NULL when an expression cannot be
 // re-created in isolation, and the caller falls back to the stored form.
+//
+// Each one leaves through canonUndo. A block that returned normally would
+// keep every lock it took (the temp table, its TOAST table and index, the
+// objects it dropped) until the fingerprint ended: one set per CHECK, default,
+// index, policy and view, which fills the server's lock table on a schema of
+// ordinary size. The temp object is found by name at run time because a
+// 'name'::regclass constant is resolved once, when the statement is parsed.
 const canonicalizers = `
 CREATE FUNCTION pg_temp.mk_canon_check(tbl oid, def text) RETURNS text LANGUAGE plpgsql AS $mk$
 DECLARE out text;
@@ -120,11 +135,7 @@ BEGIN
   EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
   EXECUTE format('ALTER TABLE pg_temp.mk_canon_t ADD CONSTRAINT mk_canon_c %s', def);
   SELECT pg_get_constraintdef(c.oid, true) INTO out FROM pg_constraint c
-   WHERE c.conrelid = 'pg_temp.mk_canon_t'::regclass AND c.conname = 'mk_canon_c';
-  DROP TABLE pg_temp.mk_canon_t;
-  RETURN out;
-EXCEPTION WHEN OTHERS THEN RETURN NULL;
-END $mk$;
+   WHERE c.conrelid = to_regclass('pg_temp.mk_canon_t') AND c.conname = 'mk_canon_c';` + canonUndo + `
 CREATE FUNCTION pg_temp.mk_canon_default(tbl oid, col name, expr text) RETURNS text LANGUAGE plpgsql AS $mk$
 DECLARE out text;
 BEGIN
@@ -132,21 +143,13 @@ BEGIN
   EXECUTE format('ALTER TABLE pg_temp.mk_canon_t ALTER COLUMN %I SET DEFAULT %s', col, expr);
   SELECT pg_get_expr(d.adbin, d.adrelid) INTO out FROM pg_attrdef d
     JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-   WHERE d.adrelid = 'pg_temp.mk_canon_t'::regclass AND a.attname = col;
-  DROP TABLE pg_temp.mk_canon_t;
-  RETURN out;
-EXCEPTION WHEN OTHERS THEN RETURN NULL;
-END $mk$;
+   WHERE d.adrelid = to_regclass('pg_temp.mk_canon_t') AND a.attname = col;` + canonUndo + `
 CREATE FUNCTION pg_temp.mk_canon_index(tbl oid, def text) RETURNS text LANGUAGE plpgsql AS $mk$
 DECLARE out text;
 BEGIN
   EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
   EXECUTE regexp_replace(def, '^(CREATE (UNIQUE )?INDEX )\S+ ON (ONLY )?\S+', '\1mk_canon_i ON pg_temp.mk_canon_t');
-  out := pg_get_indexdef('pg_temp.mk_canon_i'::regclass);
-  DROP TABLE pg_temp.mk_canon_t;
-  RETURN out;
-EXCEPTION WHEN OTHERS THEN RETURN NULL;
-END $mk$;
+  out := pg_get_indexdef(to_regclass('pg_temp.mk_canon_i'));` + canonUndo + `
 CREATE FUNCTION pg_temp.mk_canon_policy(tbl oid, expr text, kind text) RETURNS text LANGUAGE plpgsql AS $mk$
 DECLARE out text;
 BEGIN
@@ -154,23 +157,28 @@ BEGIN
   EXECUTE format('CREATE TEMP TABLE mk_canon_t (LIKE %s)', tbl::regclass);
   IF kind = 'using' THEN
     EXECUTE format('CREATE POLICY mk_canon_p ON pg_temp.mk_canon_t USING (%s)', expr);
-    SELECT pg_get_expr(p.polqual, p.polrelid) INTO out FROM pg_policy p WHERE p.polrelid = 'pg_temp.mk_canon_t'::regclass;
+    SELECT pg_get_expr(p.polqual, p.polrelid) INTO out FROM pg_policy p WHERE p.polrelid = to_regclass('pg_temp.mk_canon_t');
   ELSE
     EXECUTE format('CREATE POLICY mk_canon_p ON pg_temp.mk_canon_t WITH CHECK (%s)', expr);
-    SELECT pg_get_expr(p.polwithcheck, p.polrelid) INTO out FROM pg_policy p WHERE p.polrelid = 'pg_temp.mk_canon_t'::regclass;
-  END IF;
-  DROP TABLE pg_temp.mk_canon_t;
-  RETURN out;
-EXCEPTION WHEN OTHERS THEN RETURN NULL;
-END $mk$;
+    SELECT pg_get_expr(p.polwithcheck, p.polrelid) INTO out FROM pg_policy p WHERE p.polrelid = to_regclass('pg_temp.mk_canon_t');
+  END IF;` + canonUndo + `
 CREATE FUNCTION pg_temp.mk_canon_view(def text) RETURNS text LANGUAGE plpgsql AS $mk$
 DECLARE out text;
 BEGIN
   EXECUTE 'CREATE TEMP VIEW mk_canon_v AS ' || def;
-  out := pg_get_viewdef('pg_temp.mk_canon_v'::regclass, true);
-  DROP VIEW pg_temp.mk_canon_v;
-  RETURN out;
-EXCEPTION WHEN OTHERS THEN RETURN NULL;
+  out := pg_get_viewdef(to_regclass('pg_temp.mk_canon_v'), true);` + canonUndo
+
+// canonUndo ends a canonicalizer by raising a private error once the result is
+// in a variable. Catching it rolls the block's subtransaction back, which
+// drops the temp objects and releases every lock taken to make them; the
+// variable keeps its value. Running out of a server resource is not "cannot be
+// re-created" and is raised again.
+const canonUndo = `
+  RAISE SQLSTATE 'MKC01';
+EXCEPTION
+  WHEN SQLSTATE 'MKC01' THEN RETURN out;
+  WHEN insufficient_resources THEN RAISE;
+  WHEN OTHERS THEN RETURN NULL;
 END $mk$;
 `
 
@@ -363,6 +371,20 @@ func (f fingerprint) diff(reference fingerprint) []string {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i][2:] < out[j][2:] })
 	return out
+}
+
+// errLockTable marks an error lockTableError has explained.
+var errLockTable = errors.New("the server has no free lock")
+
+// lockTableError explains PostgreSQL's "out of shared memory", which is all
+// it reports when its lock table is full.
+func lockTableError(doing string, err error) error {
+	if err == nil || errors.Is(err, errLockTable) || !strings.Contains(err.Error(), "out of shared memory") {
+		return err
+	}
+	return fmt.Errorf("migratekit: %s: %w. Its lock table has about max_locks_per_transaction × (max_connections + max_prepared_transactions) "+
+		"entries for every session together; raise max_locks_per_transaction (it takes a restart) or retry when other sessions hold fewer: %w",
+		doing, errLockTable, err)
 }
 
 // renderDiff formats a fingerprint diff for an operator, capped so a boot

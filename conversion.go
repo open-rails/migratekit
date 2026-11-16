@@ -320,6 +320,9 @@ func (p *Postgres) settleDrift(ctx context.Context, conn *sql.Conn, migrations [
 	}
 	fresh, err := p.scratchFingerprint(ctx, tx, p.currentRender(applied))
 	if err != nil {
+		if errors.Is(err, errLockTable) {
+			resolution += "\n  An edit verified by other means can be accepted with `migratekit repair accept-content`."
+		}
 		return fmt.Errorf("%w: applied migration edited: %s, and the applied migrations could not be rebuilt for comparison (%v), so nothing was applied.\n%s",
 			ErrSchemaMismatch, what, err, resolution)
 	}
@@ -398,10 +401,8 @@ func (p *Postgres) currentRender(want []Migration) Render {
 func (p *Postgres) scratchFingerprint(ctx context.Context, tx *sql.Tx, render Render) (fp fingerprint, err error) {
 	built := 0
 	defer func() {
-		// One transaction holds a lock per rebuilt object; say so instead of a raw 53200.
-		if err != nil && (strings.Contains(err.Error(), "SQLSTATE 53200") || strings.Contains(err.Error(), "out of shared memory")) {
-			err = fmt.Errorf("migratekit: rebuilding %d migrations in a scratch schema exhausted max_locks_per_transaction; raise it, or accept verified edits with `migratekit repair accept-content`: %w", built, err)
-		}
+		err = lockTableError(fmt.Sprintf("rebuilding %d migrations in a scratch schema, "+
+			"which holds a lock on every table, index and sequence they create until the comparison ends", built), err)
 	}()
 	var raw [6]byte
 	if _, err := rand.Read(raw[:]); err != nil {
