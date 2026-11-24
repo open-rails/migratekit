@@ -11,6 +11,7 @@ package chmigrate
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -38,6 +39,10 @@ type Config struct {
 	Password   string
 	App        string
 	Cluster    string // Optional; if specified, uses ON CLUSTER for DDL statements
+	// TLS dials ClientAddr over TLS (ClickHouse's secure native port, usually
+	// 9440) and verifies the server with it. Nil dials in plain text, password
+	// included: keep that to a private network.
+	TLS *tls.Config
 
 	// Required. ClickHouse migration tracking + locking is done in Postgres:
 	// - tracking: Postgres public.migrations with database='clickhouse'
@@ -57,6 +62,7 @@ type ClickHouse struct {
 	pass    string
 	app     string
 	cluster string // Optional cluster name for ON CLUSTER DDL
+	tls     *tls.Config
 
 	tracker *coremigrate.Tracker
 }
@@ -76,6 +82,7 @@ func New(config *Config) *ClickHouse {
 		pass:    config.Password,
 		app:     config.App,
 		cluster: config.Cluster,
+		tls:     config.TLS,
 		tracker: tr,
 	}
 }
@@ -107,6 +114,7 @@ func (c *ClickHouse) connect() error {
 	}
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: []string{c.addr},
+		TLS:  c.tls,
 		Auth: clickhouse.Auth{
 			Database: c.db,
 			Username: c.user,

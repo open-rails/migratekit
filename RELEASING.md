@@ -2,7 +2,8 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.11.4: reading a schema fingerprint releases
+The recommended release is v1.12.0: `chmigrate.Config.TLS` dials ClickHouse
+over TLS. In v1.11.4 reading a schema fingerprint releases
 the locks of each canonicalization as it goes, so conversions and strict
 integrity run on a default PostgreSQL whatever the size of the schema; the
 reference build still locks every relation it creates, and a full lock table

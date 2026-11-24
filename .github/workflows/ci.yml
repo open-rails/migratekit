@@ -75,3 +75,92 @@ jobs:
               raise SystemExit(f"Missing required tests: {missing}; skipped tests: {skipped}")
           print(f"All {len(required)} required live regressions passed; no tests skipped.")
           PY
+
+  clickhouse:
+    name: ClickHouse migrations over TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_USER: migratekit
+          POSTGRES_PASSWORD: migratekit
+          POSTGRES_DB: migratekit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U migratekit -d migratekit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MIGRATEKIT_TEST_DATABASE_URL: postgres://migratekit:migratekit@localhost:5432/migratekit?sslmode=disable
+      MIGRATEKIT_TEST_CLICKHOUSE_TLS_ADDR: 127.0.0.1:9440
+      MIGRATEKIT_TEST_CLICKHOUSE_USER: migratekit
+      MIGRATEKIT_TEST_CLICKHOUSE_PASS: migratekit
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Start ClickHouse serving only its secure native port
+        run: |
+          dir="$RUNNER_TEMP/clickhouse-tls"
+          mkdir -p "$dir" && cd "$dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=migratekit test CA" -keyout ca.key -out ca.crt
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" -keyout server.key -out server.csr
+          printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > san.ext
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt
+          chmod 644 server.key
+          cat > tls.xml <<'XML'
+          <clickhouse>
+            <tcp_port_secure>9440</tcp_port_secure>
+            <openSSL>
+              <server>
+                <certificateFile>/etc/clickhouse-server/tls/server.crt</certificateFile>
+                <privateKeyFile>/etc/clickhouse-server/tls/server.key</privateKeyFile>
+                <loadDefaultCAFile>false</loadDefaultCAFile>
+                <verificationMode>none</verificationMode>
+              </server>
+            </openSSL>
+          </clickhouse>
+          XML
+          # Only 9440 is published: a test dial that is not TLS cannot reach the plain port.
+          docker run -d --name clickhouse -p 127.0.0.1:9440:9440 \
+            -e CLICKHOUSE_USER=migratekit -e CLICKHOUSE_PASSWORD=migratekit \
+            -v "$dir/tls.xml:/etc/clickhouse-server/config.d/tls.xml:ro" \
+            -v "$dir:/etc/clickhouse-server/tls:ro" \
+            clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
+          echo "MIGRATEKIT_TEST_CLICKHOUSE_CA_FILE=$dir/ca.crt" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if docker exec clickhouse clickhouse-client --user migratekit --password migratekit -q "SELECT 1" >/dev/null 2>&1 &&
+              openssl s_client -connect 127.0.0.1:9440 -servername localhost -CAfile ca.crt -verify_return_error </dev/null >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs clickhouse
+          exit 1
+      - name: Test ClickHouse migrations with the race detector
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=5m -json ./chmigrate | tee "$RUNNER_TEMP/migratekit-clickhouse.jsonl"
+      - name: Require the TLS regression
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          events = [json.loads(line) for line in Path(
+              os.environ["RUNNER_TEMP"], "migratekit-clickhouse.jsonl"
+          ).read_text().splitlines()]
+          passed = {event.get("Test") for event in events if event["Action"] == "pass"}
+          if "TestLiveTLS" not in passed:
+              raise SystemExit("TestLiveTLS did not pass")
+          print("TestLiveTLS passed against a TLS-only ClickHouse.")
+          PY
+      - name: Stop ClickHouse
+        if: always()
+        run: docker rm -f clickhouse || true
