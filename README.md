@@ -4,8 +4,10 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.11.4 is the recommended v1 release.** Schema comparison (conversions,
-strict integrity and `SchemaDiff`) no longer fills the server's lock table:
+**v1.12.0 is the recommended v1 release.** `chmigrate.Config.TLS` dials
+ClickHouse over TLS; before it, ClickHouse migrations dialed in plain text,
+password included. In v1.11.4 schema comparison (conversions,
+strict integrity and `SchemaDiff`) stopped filling the server's lock table:
 reading a schema holds the same few locks whatever its size, where v1.11.3
 and earlier kept several per CHECK, default, index, policy and view and ran a
 default PostgreSQL out of shared memory on a schema of about a hundred tables.
@@ -40,7 +42,7 @@ excludes the retired versions from normal version queries; see
 ## Install
 
 ```bash
-go get github.com/open-rails/migratekit@v1.11.4
+go get github.com/open-rails/migratekit@v1.12.0
 ```
 
 ## Usage
@@ -129,6 +131,8 @@ func main() {
     m.ApplyMigrations(ctx, migrations)
 }
 ```
+
+Set `TLS` (a `*tls.Config`) to dial `ClientAddr` over TLS, ClickHouse's secure native port (usually 9440), verifying the server with it: `RootCAs` for a private CA, `ServerName` when the address is not the certificate's name. Without it the password crosses in plain text, so keep a plain listener on a private network. `ValidateMigrations` reads only the PostgreSQL ledger and never dials ClickHouse.
 
 ### Startup validation (read-only)
 
