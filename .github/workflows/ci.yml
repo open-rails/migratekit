@@ -67,6 +67,8 @@ jobs:
               "TestCanonicalizersReleaseTheirLocks",
               "TestFingerprintLocksDoNotGrowWithTheSchema",
               "TestLockTableExhaustionIsExplained",
+              "TestImmutableMigrationsRefuseAnEditWithoutARebuild",
+              "TestImmutableMigrationsStillConvert",
           }
           passed = {event.get("Test") for event in events if event["Action"] == "pass"}
           skipped = [event for event in events if event["Action"] == "skip"]

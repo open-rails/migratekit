@@ -4,7 +4,8 @@ Minimal database migration library with app-scoped migrations and automatic lock
 
 ## Release baseline
 
-**v1.12.0 is the recommended v1 release.** `chmigrate.Config.TLS` dials
+**v1.13.0 is the recommended v1 release.** `WithImmutableMigrations` refuses an edited applied migration from the ledger alone, without rebuilding the schema (see [Immutable migrations](#immutable-migrations)).
+v1.12.0 added `chmigrate.Config.TLS`, which dials
 ClickHouse over TLS; before it, ClickHouse migrations dialed in plain text,
 password included. In v1.11.4 schema comparison (conversions,
 strict integrity and `SchemaDiff`) stopped filling the server's lock table:
@@ -168,7 +169,7 @@ pointing at it.
 | What you see | What it means | Resolution |
 |---|---|---|
 | `number "N" was already applied by a DIFFERENT file` **(error)** | Two lanes claimed N; the other one merged first. Your file would be recorded as already applied and its DDL would never run. | Renumber your file to the next free number. Nothing in the database changes. |
-| `migration X was EDITED after it was applied` **(warning — boot proceeds)** | X's SQL tokens changed since it ran here. This database has the old schema, a fresh one gets the new. | Inspect the diff. Acknowledged intentional change: `repair accept-content N --reason "…"`; otherwise revert and add a new migration. Whitespace/comments are ignored automatically. |
+| `migration X was EDITED after it was applied` **(warning — boot proceeds; error under `WithImmutableMigrations`)** | X's SQL tokens changed since it ran here. This database has the old schema, a fresh one gets the new. | Inspect the diff. Acknowledged intentional change: `repair accept-content N --reason "…"`; otherwise revert and add a new migration. Whitespace/comments are ignored automatically. |
 | `migration X sorts BEFORE Y, which is already applied` **(error, `WithStrictOrdering` only)** | A lane branched below the high-water mark and merged late. | Renumber X above Y. Genuine backport: `apply --allow-below-applied N --reason "…"`, which applies it once and records the deviation. |
 | `migration X is failed, not applied` **(error)** | A `-- migratekit:no-transaction` migration failed or was interrupted, so it may be HALF applied. The ledger holds the state rather than guessing. | Undo the partial work (a failed `CREATE INDEX CONCURRENTLY` leaves an INVALID index — `DROP INDEX` it), then `repair resolve N --rerun --reason "…"`. If the DDL actually landed, `repair resolve N --applied --reason "…"`. |
 | Row 1's error, but **your files are right and the ledger is the wrong side** | A restored backup, an adopted database, or a hand-fixed row: the ledger remembers a tree that no longer exists. | `repair adopt N --reason "…"` — or `repair adopt --all-unmatched --reason "…"` when every row mismatches, which is what a restore actually looks like. |
@@ -241,10 +242,12 @@ Unexported helpers and exact error-message wording are implementation details.
 | `(*Postgres) ValidateAllApplied(ctx, []Migration) error` | Read-only startup gate: error naming pending migrations, never creates tables. |
 | `(*Postgres) WithStrictOrdering() *Postgres` | Refuse a pending migration that sorts below one already applied. Opt-in. |
 | `(*Postgres) WithStrictIntegrity() *Postgres` | An edited applied migration no longer just warns: the live schema is compared with a fresh build of the applied migrations. Equal: digests re-stamped (audit verb `verify-content`). Different: refuse with the migration, the schema diff and the resolution. Needs `WithSchema`. Opt-in. |
+| `(*Postgres) WithImmutableMigrations() *Postgres` | Applied migrations never change: an applied migration whose file differs by any byte is refused with `ErrMigrationEdited`, from the ledger alone. Takes precedence over `WithStrictIntegrity`. See [Immutable migrations](#immutable-migrations). Opt-in. |
 | `(*Postgres) WithConversions(...Conversion) *Postgres` | Declares retired chains this chain converts from. See [Conversions](#conversions). |
 | `SchemaDiff(ctx, *sql.DB, schema, reference string) ([]string, error)` | Read-only comparison of two schemas by behaviour, with the rules conversions use. |
 | `(*Postgres) WithRender(Render) *Postgres` | How the current chain renders for another schema. Needed only for hard-qualified migrations. |
 | `type Conversion struct { Name string; Retired Render; Replaces int; SQL func(schema string) (string, error); Fallback string }`, `type Render func(schema string) ([]Migration, error)`, `ErrSchemaMismatch` | Conversion declaration and its refusal error. |
+| `ErrMigrationEdited` | The `WithImmutableMigrations` refusal. |
 | `(*Postgres) AppliedRecords(ctx) (map[string]AppliedRecord, error)` | Ledger keyed by tracking key, carrying the recorded filename and content digest. |
 | `(*Postgres) WithWarnFunc(func(Discrepancy)) *Postgres` | Replace the warning sink. Default logs through `slog.Default()` at warn level; never silent unless you make it so. |
 | `(*Postgres) Status(ctx, []Migration) (Status, error)` | Applied set, pending set, every discrepancy with cause and resolution, and the repair history. Tracker tables are initialized automatically. |
@@ -284,7 +287,7 @@ ClickHouse is a separate subpackage so the root package never imports
 These behaviors define the current API:
 
 1. **Tracking table**: `public.migrations (id, app, database, schema, sequence, filename, content_sha256, semantic_sha256, status, error, migrated_at, UNIQUE(app, database, schema, sequence))` with `database` ∈ {`postgres`, `clickhouse`}. `public.migration_repairs` records every repair.
-2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is always an operator warning; comment/format-only edits compare cleanly through `semantic_sha256`.
+2. **Tracking key**: the normalized numeric prefix (`Prefix`), not the filename. A different file claiming an applied number is a hard error. Edited SQL is an operator warning by default; comment/format-only edits compare cleanly through `semantic_sha256`.
 3. **Discovery**: only `*.up.sql` files; `*.down.sql` is reserved; numeric-prefix ordering; duplicate prefixes are a load error.
 4. **Locking**: appliers are serialized by Postgres advisory locks held on a pinned connection for the duration of the apply. Under-lock ledger checks, DDL and ledger writes use that same connection, so a pool limited to one connection is supported. Nontransactional migrations restore its previous `search_path` before release. The lock is taken only when unapplied migrations exist; process death releases the lock with the connection.
 5. **Templates**: `{{VAR}}` / `${VAR}` substitute from the environment at apply time; an unset variable is an error; an explicitly-empty variable substitutes as-is; `{{ON_CLUSTER}}`/`${ON_CLUSTER}` expand from `chmigrate.Config.Cluster` (empty → removed).
@@ -299,7 +302,7 @@ Each migration is identified by its numeric sequence within its application,
 database driver, and configured schema. A different filename claiming an applied
 sequence is an error. Edited SQL emits a warning; comments, whitespace, and
 unquoted-identifier case are ignored by the semantic digest. Content drift does
-not block startup unless `WithStrictIntegrity` is set. Apply back-stamps the
+not block startup unless `WithStrictIntegrity` or `WithImmutableMigrations` is set. Apply back-stamps the
 semantic digest onto older rows whose bytes still match. `WithStrictOrdering` optionally rejects pending migrations
 below an already-applied sequence.
 
@@ -341,6 +344,18 @@ indexes each). The server's lock table has at least
 entries, 6400 by default, shared by every session. When too few are free the
 refusal says what was being done and names the setting, and nothing is
 changed.
+
+### Immutable migrations
+
+An application whose released migrations never change declares `WithImmutableMigrations()`. `ApplyMigrations` then refuses any applied migration whose file differs from the recorded content by a single byte, comments and whitespace included, with `ErrMigrationEdited`, naming each one with its applied and file digests. It reads the ledger and nothing else: no reference build, no re-stamp, no migration lock, and nothing is applied. The fix is in the build (restore the file and put the change in a new migration) or in the database (rebuild it).
+
+- Declared conversions run first: a ledger recording exactly a retired chain is converted as above, and the converted ledger is then checked like any other.
+- It takes precedence over `WithStrictIntegrity`, whose drift settling never runs, so `WithRender` serves conversions only.
+- `Status` reports each edit as an error.
+- The repair verbs are unchanged: `repair accept-content` still re-stamps a record with its reason and audit row. That is an operator's decision, never the migrator's.
+- A migration recorded by a newer build, which this build does not carry, is left alone.
+
+`ErrMigrationEdited` is not `ErrSchemaMismatch`: the schema is never read, so the refusal says the file changed, not that the database differs.
 
 ### Authoring checks
 

@@ -34,10 +34,11 @@ import (
 // IDENTITY is a hard error: it is the silent-never-runs killer, and the fix
 // (renumber, or adopt a restored ledger) is always available.
 //
-// INTEGRITY is always a WARNING. The operator who edited an applied migration
-// may have no way back to the old bytes; refusing to boot cannot repair either
-// schema. Drift is reported by Status and cleared, on the record, by
-// `repair accept-content`.
+// INTEGRITY is a WARNING by default. The operator who edited an applied
+// migration may have no way back to the old bytes; refusing to boot cannot
+// repair either schema. Drift is reported by Status and cleared, on the
+// record, by `repair accept-content`. An application whose released
+// migrations never change refuses it instead (WithImmutableMigrations).
 //
 // ORDERING is separate and opt-in via WithStrictOrdering(). It refuses to
 // apply a pending migration that sorts below one already applied — an
@@ -153,6 +154,8 @@ func (p *Postgres) appliedRecords(ctx context.Context, db migrationDB) (map[stri
 // each one is.
 type checkOptions struct {
 	strictOrdering bool
+	// immutable makes any changed byte of an applied migration an error.
+	immutable bool
 	// allowBelow holds ledger keys exempted from the ordering rule by an
 	// explicit operator exception (see ApplyWithOrderingException).
 	allowBelow map[string]bool
@@ -204,11 +207,14 @@ func analyze(migrations []Migration, applied map[string]AppliedRecord, opts chec
 		}
 		// The same file, edited after it ran. Every database that already
 		// applied it now diverges from a fresh one.
-		if rec.Digest != "" && rec.Digest != ContentDigest(m.Content) &&
-			(rec.SemanticDigest == "" || rec.SemanticDigest != SemanticContentDigest(m.Content)) {
+		if edited(rec, m, opts.immutable) {
+			severity := SeverityWarning
+			if opts.immutable {
+				severity = SeverityError
+			}
 			out = append(out, Discrepancy{
 				Kind:           KindContentDrift,
-				Severity:       SeverityWarning,
+				Severity:       severity,
 				Key:            rec.Key,
 				File:           m.Name,
 				LedgerFilename: rec.Filename,
@@ -315,6 +321,35 @@ func analyze(migrations []Migration, applied map[string]AppliedRecord, opts chec
 		})
 	}
 	return out
+}
+
+// edited reports whether the file differs from the applied record: by its
+// SQL tokens, or by any byte when migrations are immutable. A record with no
+// digest proves nothing either way.
+func edited(rec AppliedRecord, m Migration, immutable bool) bool {
+	if rec.Digest == "" || rec.Digest == ContentDigest(m.Content) {
+		return false
+	}
+	return immutable || rec.SemanticDigest == "" || rec.SemanticDigest != SemanticContentDigest(m.Content)
+}
+
+// refusal is the error an apply stops on. Under immutable migrations every
+// edited migration is named at once; otherwise it is the first error.
+func (p *Postgres) refusal(discrepancies []Discrepancy) error {
+	if p.immutable {
+		var names []string
+		for _, d := range discrepancies {
+			if d.Kind == KindContentDrift && d.Severity == SeverityError {
+				names = append(names, fmt.Sprintf("%s (applied %s, file %s)", d.File, shortDigest(d.LedgerDigest), shortDigest(d.FileDigest)))
+			}
+		}
+		if len(names) > 0 {
+			return fmt.Errorf("%w: %s, in app %q schema %q. Released migrations never change, so nothing was applied.\n"+
+				"  RESOLUTION: restore the file to the content this database ran and put the change in a new migration, or rebuild this database.",
+				ErrMigrationEdited, strings.Join(names, ", "), p.app, p.schema)
+		}
+	}
+	return firstError(discrepancies)
 }
 
 // firstError returns the first error-severity discrepancy as an error.

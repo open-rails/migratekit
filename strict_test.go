@@ -1,6 +1,9 @@
 package migratekit
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestCheckChain(t *testing.T) {
 	tests := []struct {
@@ -120,6 +123,34 @@ func TestAnalyze(t *testing.T) {
 		}
 		if ds := analyze([]Migration{mig("0002_a.up.sql", formatted)}, applied, checkOptions{}); len(ds) != 0 {
 			t.Fatalf("cosmetic SQL edit should be clean, got: %v", ds)
+		}
+	})
+
+	t.Run("immutable migrations refuse any changed byte", func(t *testing.T) {
+		original := "CREATE TABLE example (id bigint);"
+		applied := map[string]AppliedRecord{
+			"2": {Key: "2", Filename: "0002_a.up.sql", Digest: ContentDigest(original),
+				SemanticDigest: SemanticContentDigest(original)},
+		}
+		chain := []Migration{mig("0002_a.up.sql", "-- comment\n"+original)}
+		d := only(analyze(chain, applied, checkOptions{immutable: true}))
+		if d.Kind != KindContentDrift || d.Severity != SeverityError {
+			t.Fatalf("a comment edit must be an error under immutability, got %s/%s", d.Kind, d.Severity)
+		}
+		if contains(d.String(), "accept-content") || !contains(d.String(), "NEW migration") {
+			t.Errorf("immutable guidance must point at a new migration, not a re-stamp; got:\n%s", d.String())
+		}
+		err := (&Postgres{app: "a", schema: "s", immutable: true}).refusal([]Discrepancy{d})
+		if !errors.Is(err, ErrMigrationEdited) || errors.Is(err, ErrSchemaMismatch) {
+			t.Fatalf("err = %v, want ErrMigrationEdited only", err)
+		}
+		for _, want := range []string{"0002_a.up.sql", shortDigest(d.LedgerDigest), shortDigest(d.FileDigest), "never change", "new migration", "rebuild this database"} {
+			if !contains(err.Error(), want) {
+				t.Errorf("refusal lacks %q:\n%v", want, err)
+			}
+		}
+		if ds := analyze([]Migration{mig("0002_a.up.sql", original)}, applied, checkOptions{immutable: true}); len(ds) != 0 {
+			t.Fatalf("an unchanged file must be clean: %v", ds)
 		}
 	})
 

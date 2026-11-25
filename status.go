@@ -33,7 +33,8 @@ const (
 	// different file. Hard error — the file in the tree would never run.
 	KindNumberMismatch DiscrepancyKind = "number_applied_by_different_file"
 	// KindContentDrift: an applied migration's SQL tokens changed since it ran.
-	// It is informational and never blocks applying later migrations.
+	// A warning that never blocks applying later migrations, except under
+	// WithImmutableMigrations, where any changed byte is an error.
 	KindContentDrift DiscrepancyKind = "applied_migration_edited"
 	// KindOrderViolation: a pending migration sorts below one already
 	// applied. Error under WithStrictOrdering.
@@ -147,6 +148,12 @@ func (d Discrepancy) causes() [][2]string {
 			},
 		}
 	case KindContentDrift:
+		if d.Severity == SeverityError {
+			return [][2]string{{
+				"a released migration was edited, and this application's migrations are immutable.",
+				"Restore the file to the applied content and put the change in a NEW migration, or rebuild this database.",
+			}}
+		}
 		return [][2]string{
 			{
 				"the edit was intentional and cosmetic (a comment, whitespace, a reformat).",
@@ -326,6 +333,7 @@ func (p *Postgres) Status(ctx context.Context, migrations []Migration) (Status, 
 
 	st.Discrepancies = analyze(migrations, applied, checkOptions{
 		strictOrdering:    p.strictOrdering,
+		immutable:         p.immutable,
 		includeLedgerOnly: true,
 	})
 	sort.SliceStable(st.Discrepancies, func(i, j int) bool {

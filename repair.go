@@ -399,8 +399,9 @@ func (p *Postgres) ApplyWithOrderingException(ctx context.Context, migrations []
 		if err != nil {
 			return err
 		}
-		return firstError(analyze(migrations, records, checkOptions{
+		return p.refusal(analyze(migrations, records, checkOptions{
 			strictOrdering: p.strictOrdering,
+			immutable:      p.immutable,
 			allowBelow:     exempt,
 		}))
 	}
