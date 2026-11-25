@@ -2,7 +2,9 @@
 
 ## Fresh v1 baseline
 
-The recommended release is v1.12.0: `chmigrate.Config.TLS` dials ClickHouse
+The recommended release is v1.13.0: `WithImmutableMigrations` refuses an
+edited applied migration from the ledger alone, without rebuilding the schema.
+v1.12.0 added `chmigrate.Config.TLS`, which dials ClickHouse
 over TLS. In v1.11.4 reading a schema fingerprint releases
 the locks of each canonicalization as it goes, so conversions and strict
 integrity run on a default PostgreSQL whatever the size of the schema; the

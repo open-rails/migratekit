@@ -62,6 +62,11 @@ type Conversion struct {
 // so continuing would apply migrations to a schema they were not written for.
 var ErrSchemaMismatch = errors.New("migratekit: schema does not match its ledger")
 
+// ErrMigrationEdited is returned under WithImmutableMigrations when an applied
+// migration's file differs from what ran. It is not ErrSchemaMismatch: the
+// schema is never read.
+var ErrMigrationEdited = errors.New("migratekit: applied migration edited")
+
 // WithConversions declares retired chains this migrator can convert from.
 func (p *Postgres) WithConversions(conversions ...Conversion) *Postgres {
 	p.conversions = append(p.conversions, conversions...)
@@ -87,11 +92,32 @@ func (p *Postgres) WithStrictIntegrity() *Postgres {
 	return p
 }
 
+// WithImmutableMigrations declares that applied migrations never change. An
+// applied migration whose file differs from the recorded content by any byte,
+// comments and whitespace included, is refused with ErrMigrationEdited before
+// anything is applied: no schema is rebuilt or compared, the record is not
+// re-stamped and no migration lock is taken for it. Declared conversions still
+// run first, since a retired chain's ledger records other files by design.
+// It takes precedence over WithStrictIntegrity, whose drift settling never
+// runs, so WithRender serves conversions only. Status reports the edit as an
+// error. The repair verbs are unchanged: an audited `repair accept-content`
+// re-stamps the record. A migration recorded by a newer build is left alone.
+func (p *Postgres) WithImmutableMigrations() *Postgres {
+	p.immutable = true
+	return p
+}
+
+// settlesDrift reports whether an edited applied migration is settled by
+// comparing schemas rather than refused or warned about.
+func (p *Postgres) settlesDrift() bool {
+	return p.strictIntegrity && !p.immutable
+}
+
 // reconcile runs before any migration is applied. It converts a retired chain
 // or, under strict integrity, settles content drift. It takes the migration
 // lock only when there is something to decide.
 func (p *Postgres) reconcile(ctx context.Context, migrations []Migration) (err error) {
-	if len(p.conversions) == 0 && !p.strictIntegrity {
+	if len(p.conversions) == 0 && !p.settlesDrift() {
 		return nil
 	}
 	records, err := p.AppliedRecords(ctx)
@@ -132,7 +158,7 @@ func (p *Postgres) reconcile(ctx context.Context, migrations []Migration) (err e
 		}
 		return nil
 	}
-	if p.strictIntegrity {
+	if p.settlesDrift() {
 		return p.settleDrift(ctx, p.lockConn, migrations, records)
 	}
 	return nil
@@ -159,7 +185,7 @@ func (p *Postgres) reconcileNeeded(ctx context.Context, migrations []Migration, 
 		}
 		return populated, nil
 	}
-	return p.strictIntegrity && len(drifted(migrations, records)) > 0, nil
+	return p.settlesDrift() && len(drifted(migrations, records)) > 0, nil
 }
 
 // ledgerRecords reports whether the ledger holds exactly the retired chain,
@@ -358,11 +384,10 @@ func drifted(migrations []Migration, records map[string]AppliedRecord) []Migrati
 	var out []Migration
 	for _, m := range migrations {
 		rec, ok := records[Prefix(m.Name)]
-		if !ok || rec.isDirty() || (rec.Filename != "" && rec.Filename != m.Name) || rec.Digest == "" {
+		if !ok || rec.isDirty() || (rec.Filename != "" && rec.Filename != m.Name) {
 			continue
 		}
-		if rec.Digest != ContentDigest(m.Content) &&
-			(rec.SemanticDigest == "" || rec.SemanticDigest != SemanticContentDigest(m.Content)) {
+		if edited(rec, m, false) {
 			out = append(out, m)
 		}
 	}

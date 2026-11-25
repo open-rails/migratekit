@@ -55,10 +55,11 @@ type Postgres struct {
 	// warn is the sink for warning-severity discrepancies. See WithWarnFunc.
 	warn func(Discrepancy)
 
-	// conversions, render and strictIntegrity: see conversion.go.
+	// conversions, render, strictIntegrity and immutable: see conversion.go.
 	conversions     []Conversion
 	render          Render
 	strictIntegrity bool
+	immutable       bool
 }
 
 // NewPostgres creates a Postgres migrator
@@ -353,6 +354,7 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 
 	opts := checkOptions{
 		strictOrdering: p.strictOrdering,
+		immutable:      p.immutable,
 		allowBelow:     allowBelow,
 	}
 
@@ -364,7 +366,7 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	}
 	discrepancies := analyze(migrations, records, opts)
 	p.emit(discrepancies) // warnings once, on the pass that always runs
-	if err := firstError(discrepancies); err != nil {
+	if err := p.refusal(discrepancies); err != nil {
 		return err
 	}
 
@@ -395,7 +397,7 @@ func (p *Postgres) applyMigrations(ctx context.Context, migrations []Migration, 
 	if err != nil {
 		return err
 	}
-	if err := firstError(analyze(migrations, records, opts)); err != nil {
+	if err := p.refusal(analyze(migrations, records, opts)); err != nil {
 		return err
 	}
 	toApply = toApply[:0]
